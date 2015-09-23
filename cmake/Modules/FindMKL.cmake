@@ -14,9 +14,11 @@
 
 
 # ---[ Options
-caffe_option(MKL_USE_SINGLE_DYNAMIC_LIBRARY "Use single dynamic library interface" ON)
+caffe_option(MKL_USE_SINGLE_DYNAMIC_LIBRARY "Use single dynamic library interface" OFF)
 caffe_option(MKL_USE_STATIC_LIBS "Use static libraries" OFF IF NOT MKL_USE_SINGLE_DYNAMIC_LIBRARY)
-caffe_option(MKL_MULTI_THREADED  "Use multi-threading"   ON IF NOT MKL_USE_SINGLE_DYNAMIC_LIBRARY)
+caffe_option(MKL_MULTI_THREADED  "Use multi-threading"  OFF IF NOT MKL_USE_SINGLE_DYNAMIC_LIBRARY)
+
+message(STATUS "MKL_USE_SINGLE_DYNAMIC_LIBRARY: ${MKL_USE_SINGLE_DYNAMIC_LIBRARY}")
 
 # ---[ Root folders
 set(INTEL_ROOT "/opt/intel" CACHE PATH "Folder contains intel libs")
@@ -52,9 +54,11 @@ else()
     list(APPEND __mkl_libs intel_thread)
   else()
      list(APPEND __mkl_libs sequential)
+     message(STATUS "MKL went where I wanted sequential")
   endif()
 
-  list(APPEND __mkl_libs core cdft_core)
+  #list(APPEND __mkl_libs core cdft_core)
+  list(APPEND __mkl_libs core)
 endif()
 
 

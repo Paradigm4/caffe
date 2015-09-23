@@ -25,10 +25,26 @@ void caffe_cpu_gemm<double>(const CBLAS_TRANSPOSE TransA,
     const CBLAS_TRANSPOSE TransB, const int M, const int N, const int K,
     const double alpha, const double* A, const double* B, const double beta,
     double* C) {
-  int lda = (TransA == CblasNoTrans) ? K : M;
-  int ldb = (TransB == CblasNoTrans) ? N : K;
-  cblas_dgemm(CblasRowMajor, TransA, TransB, M, N, K, alpha, A, lda, B,
-      ldb, beta, C, N);
+
+    int lda = (TransA == CblasNoTrans) ? K : M;
+    int ldb = (TransB == CblasNoTrans) ? N : K;
+
+    if (getenv("CAFFE_SCIDB_GEMM")) {
+
+        scidb_dgemm(TransA, TransB, M, N, K, alpha, A, lda, B, ldb, beta, C, N);
+        //
+        Type conn = get_cached_scidb_connection();
+        // get connecton
+        //
+        // make A,B, and C (if it is not constant-zero) 
+
+        // caffe matrix storage is apparently row-major by looking at the cblass_dgemm call
+        // send the query
+
+    } else {
+        cblas_dgemm(CblasRowMajor, TransA, TransB, M, N, K, alpha, A, lda, B,
+                    ldb, beta, C, N);
+    }
 }
 
 template <>
