@@ -5,6 +5,7 @@
 
 #include "caffe/common.hpp"
 #include "caffe/util/math_functions.hpp"
+#include "caffe/util/math_functions_scidb.hpp"
 #include "caffe/util/rng.hpp"
 
 namespace caffe {
@@ -29,21 +30,12 @@ void caffe_cpu_gemm<double>(const CBLAS_TRANSPOSE TransA,
     int lda = (TransA == CblasNoTrans) ? K : M;
     int ldb = (TransB == CblasNoTrans) ? N : K;
 
-    if (getenv("CAFFE_SCIDB_GEMM")) {
-
-        scidb_dgemm(TransA, TransB, M, N, K, alpha, A, lda, B, ldb, beta, C, N);
-        //
-        Type conn = get_cached_scidb_connection();
-        // get connecton
-        //
-        // make A,B, and C (if it is not constant-zero) 
-
-        // caffe matrix storage is apparently row-major by looking at the cblass_dgemm call
-        // send the query
-
+    if (getenv("SCIDB_SHIM_URL")) {
+        caffe_scidb_gemm(TransA, TransB, M, N, K,
+                         alpha, A, lda, B, ldb, beta, C, N);
     } else {
-        cblas_dgemm(CblasRowMajor, TransA, TransB, M, N, K, alpha, A, lda, B,
-                    ldb, beta, C, N);
+        cblas_dgemm(CblasRowMajor, TransA, TransB, M, N, K,
+                    alpha, A, lda, B, ldb, beta, C, N);
     }
 }
 

@@ -62,7 +62,18 @@ if(NOT HAVE_CUDA)
 
   # TODO: remove this not cross platform define in future. Use caffe_config.h instead.
   add_definitions(-DCPU_ONLY)
+  include_directories(SYSTEM ${CURL_INCLUDE_DIR})
+  list(APPEND Caffe_LINKER_LIBS ${CURL_LIBRARIES})
 endif()
+
+# ---[ SciDB
+if(USE_SCIDB)
+    find_package(CURL REQUIRED)
+    include_directories(SYSTEM ${CURL_INCLUDE_DIR})
+    list(APPEND Caffe_LINKER_LIBS ${CURL_LIBRARIES})
+endif()
+
+
 
 # ---[ OpenCV
 if(USE_OPENCV)
