@@ -91,11 +91,12 @@ struct Shim {
 
 Shim& getShim();
 
+template<typename scalar_tt>
 void dgemmScidbServer(const char& TRANSA, const char& TRANSB,
                       long M, long N, long K,
-                      double ALPHA, const double* aData, long LDA,
-                                    const double* bData, long LDB,
-                      double BETA,        double* cData, long LDC,
+                      scalar_tt ALPHA, const scalar_tt* aData, long LDA,
+                                       const scalar_tt* bData, long LDB, scalar_tt BETA,
+                                             scalar_tt* cData, long LDC,
                       Shim& shim);
 
 } // namespace scidb

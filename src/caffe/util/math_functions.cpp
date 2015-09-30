@@ -17,8 +17,9 @@ void caffe_cpu_gemm<float>(const CBLAS_TRANSPOSE TransA,
     float* C) {
   int lda = (TransA == CblasNoTrans) ? K : M;
   int ldb = (TransB == CblasNoTrans) ? N : K;
-  cblas_sgemm(CblasRowMajor, TransA, TransB, M, N, K, alpha, A, lda, B,
-      ldb, beta, C, N);
+
+  caffe_scidb_gemm(TransA, TransB, M, N, K,
+                   alpha, A, lda, B, ldb, beta, C, N);
 }
 
 template<>
@@ -30,13 +31,8 @@ void caffe_cpu_gemm<double>(const CBLAS_TRANSPOSE TransA,
     int lda = (TransA == CblasNoTrans) ? K : M;
     int ldb = (TransB == CblasNoTrans) ? N : K;
 
-    if (getenv("SCIDB_SHIM_URL")) {
-        caffe_scidb_gemm(TransA, TransB, M, N, K,
-                         alpha, A, lda, B, ldb, beta, C, N);
-    } else {
-        cblas_dgemm(CblasRowMajor, TransA, TransB, M, N, K,
-                    alpha, A, lda, B, ldb, beta, C, N);
-    }
+    caffe_scidb_gemm(TransA, TransB, M, N, K,
+                     alpha, A, lda, B, ldb, beta, C, N);
 }
 
 template <>

@@ -4,6 +4,7 @@
 #include <string>
 #include <sstream>
 #include <stdexcept>
+#include <typeinfo>
 
 #include <assert.h>
 #include <time.h>
@@ -305,17 +306,16 @@ size_t doHTMLGetData(CURL* easyHandle, const std::string& URL, char * data, size
 //
 // TODO: becomes a method of Shim
 //
-std::string executeQuery(Shim& shim, const std::string& query, const std::string& saveFormat=std::string())
+std::string executeQuery(Shim& shim, const std::string& query, const std::string& scalarName=std::string())
 {
-    //
-    // TODO: TMP ARRAYS for ALL results ... how?
-    //
-
-    // past together the query and the base URL stuff
-    std::string URL = shim.baseURL + "/execute_query?id=" + shim.session + "&query=" + query;
-    if (saveFormat.size()) {
+    // paste together the base URL stuff with the URL-escaped query
+    std::string URL = shim.baseURL + "/execute_query?id=" + shim.session
+                                   + "&query=" + curl_easy_escape(shim.curlHandle, query.c_str(), 0);
+    if (scalarName.size()) {
         URL += "&save=" ;
-        URL += saveFormat;
+        URL += "(" ;
+        URL += scalarName;
+        URL += ")" ;
     }
 
     // TODO: add a catch here and extend the exception with a from:
@@ -328,13 +328,14 @@ std::string executeQuery(Shim& shim, const std::string& query, const std::string
 //
 // TODO: becomes a method of Shim
 //
-void readBytesMatrix(Shim& shim, double* array, size_t nRow, size_t nCol)
+template<typename scalar_tt>
+void readBytesMatrix(Shim& shim, scalar_tt* array, size_t nRow, size_t nCol)
 {
-    // past together the query and the base URL stuff
+    // paste together the query and the base URL stuff
     std::stringstream ssURL;
-    ssURL << shim.baseURL << "/read_bytes?id=" << shim.session << "&n=" << nRow*nCol*sizeof(double);
+    ssURL << shim.baseURL << "/read_bytes?id=" << shim.session << "&n=" << nRow*nCol*sizeof(scalar_tt);
 
-    size_t bytesToRead = nRow*nCol*sizeof(double);
+    size_t bytesToRead = nRow*nCol*sizeof(scalar_tt);
     size_t bytesRead = doHTMLGetData(shim.curlHandle, ssURL.str(), reinterpret_cast<char*>(array), bytesToRead);
 
     // TODO: add a catch here?  what if too long? too short? 
@@ -347,10 +348,10 @@ void readBytesMatrix(Shim& shim, double* array, size_t nRow, size_t nCol)
 //
 // scan_matrix
 //
-void scan_matrix(Shim& shim, const std::string& nameA, const std::string& saveFormat)
+void scan_matrix(Shim& shim, const std::string& nameA, const std::string& scalarName)
 {
-    if (saveFormat.size() == 0) {
-        throw std::runtime_error("gemm: saveFormat must be specified");
+    if (scalarName.size() == 0) {
+        throw std::runtime_error("gemm: scalarName must be specified");
     }
 
     //
@@ -373,11 +374,47 @@ void scan_matrix(Shim& shim, const std::string& nameA, const std::string& saveFo
                                                   
     if(shim.verbose) {
         std::cerr << "XXXXX scan_matrix query is '" << ss.str() << "'" << std::endl; 
-        std::cerr << "XXXXX scan_matrix saveFormat is: " << saveFormat << std::endl; 
+        std::cerr << "XXXXX scan_matrix scalarName is: " << scalarName << std::endl; 
     }
-    std::string qid = executeQuery(shim, ss.str(), saveFormat);
+    std::string qid = executeQuery(shim, ss.str(), scalarName);
 }
 
+//
+// API: create_temp_matrix
+//
+std::string create_temp_matrix(Shim& shim, size_t nrow, size_t ncol, const std::string& resultName, const std::string& scalarTypeName)
+{
+    char createQuery[1000];
+    sprintf(createQuery, "create TEMP array %s <v:%s>[r=0:%ld-1,1000,0,c=0:%ld-1,1000,0]",
+                          resultName.c_str(), scalarTypeName.c_str(), nrow, ncol);
+    if(shim.verbose) {
+        shim.tsos << "XXXXX create_temp_matrix: createQuery is '" << createQuery << "'" << std::endl; 
+    }
+    std::string qid = executeQuery(shim, createQuery);
+    if(shim.verbose) {
+        shim.tsos << "@@@@@ create_temp_matrix: input QID: " << qid << std::endl;
+    }
+    // FACTOR
+    if(shim.verbose) {
+        shim.tsos << "@@@@@@ create_temp_matrix: dropping createQuery session" << std::endl;
+    }
+    std::string URL = shim.baseURL + "/release_session?id=" + shim.session ;
+    doHTMLGetString(shim.curlHandle, URL, false); // nothing returned on a release
+    shim.session  = doHTMLGetString(shim.curlHandle, shim.baseURL + "/new_session");
+    if(shim.verbose) {
+        shim.tsos << "@@@@@@ create_temp_matrix: new session: " << shim.session << std::endl;
+    }
+    return resultName;
+}
+
+//
+// helper, because typeid(T).name() returns "f" and "d", not float and double
+//
+template<typename scalar_tt>
+const char* typeStr(scalar_tt val) { return "unknown type"; }
+
+template<> const char* typeStr<float >(float  val) { return "float" ;}
+template<> const char* typeStr<double>(double val) { return "double";}
 
 //
 // API: send_matrix
@@ -385,12 +422,15 @@ void scan_matrix(Shim& shim, const std::string& nameA, const std::string& saveFo
 // TODO: add matrix source data pointer
 // NOTE: shim gets a new session as a side-effect
 //
-std::string send_matrix(Shim& shim, const double* data, size_t nrow, size_t ncol, const std::string& resultName)
+template<typename scalar_tt>
+std::string send_matrix(Shim& shim, const scalar_tt* data, size_t nrow, size_t ncol, const std::string& resultName)
 {
+    const char* scalarName=typeStr(data[0]);
+
     //
     // upload matrix data
     //
-    const size_t dataBytes=nrow*ncol*sizeof(double);
+    const size_t dataBytes=nrow*ncol*sizeof(scalar_tt);
 
     // may not be needed when CURLFORM_BUFFER,BUFFERPTR used
     SendStuff sendStuff;
@@ -401,6 +441,50 @@ std::string send_matrix(Shim& shim, const double* data, size_t nrow, size_t ncol
         shim.tsos << "XXXXX send_matrix: nrow " << nrow << " ncol " << ncol << std::endl; 
         shim.tsos << "XXXXX send_matrix: uploading '" << sendStuff.sizeLeft << "bytes" << std::endl; 
         shim.tsos << "XXXXX send_matrix: sendSrc " << (void*)sendStuff.sendSrc << std::endl; 
+    }
+    
+    //
+    // creates to make the TEMP arrays
+    //
+    char createLoadQuery[1000];
+    sprintf(createLoadQuery, "create TEMP array TMPLOAD123 <v:%s>[i=0:%ld-1,1000,0]", scalarName, nrow * ncol);
+    if(shim.verbose) {
+        shim.tsos << "XXXXX send_matrix: createLoadQuery is '" << createLoadQuery << "'" << std::endl; 
+    }
+    std::string qid = executeQuery(shim, createLoadQuery);
+    if(shim.verbose) {
+        shim.tsos << "@@@@@ send_matrix: input QID: " << qid << std::endl;
+    }
+    // FACTOR
+    if(shim.verbose) {
+        shim.tsos << "@@@@@@ send_matrix: dropping createLoadQuery session" << std::endl;
+    }
+    std::string URL = shim.baseURL + "/release_session?id=" + shim.session ;
+    doHTMLGetString(shim.curlHandle, URL, false); // nothing returned on a release
+    shim.session  = doHTMLGetString(shim.curlHandle, shim.baseURL + "/new_session");
+    if(shim.verbose) {
+        shim.tsos << "@@@@@@ send_matrix: new session: " << shim.session << std::endl;
+    }
+
+    char createReshapeQuery[1000];
+    sprintf(createReshapeQuery, "create TEMP array %s <v:%s>[r=0:%ld-1,1000,0,c=0:%ld-1,1000,0]",
+                                resultName.c_str(), scalarName, nrow, ncol);
+    if(shim.verbose) {
+        shim.tsos << "XXXXX send_matrix: createReshapeQuery is '" << createReshapeQuery << "'" << std::endl; 
+    }
+    qid = executeQuery(shim, createReshapeQuery);
+    if(shim.verbose) {
+        shim.tsos << "@@@@@ send_matrix: input QID: " << qid << std::endl;
+    }
+    // FACTOR
+    if(shim.verbose) {
+        shim.tsos << "@@@@@@ send_matrix: dropping createReshapeQuery session" << std::endl;
+    }
+    URL = shim.baseURL + "/release_session?id=" + shim.session ;
+    doHTMLGetString(shim.curlHandle, URL, false); // nothing returned on a release
+    shim.session  = doHTMLGetString(shim.curlHandle, shim.baseURL + "/new_session");
+    if(shim.verbose) {
+        shim.tsos << "@@@@@@ send_matrix: new session: " << shim.session << std::endl;
     }
 
     //
@@ -479,19 +563,20 @@ std::string send_matrix(Shim& shim, const double* data, size_t nrow, size_t ncol
 
     //
     // load the data file into tmp ARRAY
-    // TODO: issue a create to make the array tmp
     // TODO: don't use a hard-coded name like TMPLOAD123
     // TODO: test for a collision with an existing array
     //       rather than risk it being overwritten or incompatible
     //
+    
 
-    // curl URL
+    // "load" the datafile
     char loadQuery[1000];
-    sprintf(loadQuery, "store(input(<v:double>[i=0:%ld-1,1000,0],'%s',-2,'(double)'),TMPLOAD123)", nrow * ncol, filenameStr.c_str());
+    sprintf(loadQuery, "store(input(<v:%s>[i=0:%ld-1,1000,0],'%s',-2,'(%s)'),TMPLOAD123)",
+                        scalarName, nrow * ncol, filenameStr.c_str(), scalarName);
     if(shim.verbose) {
         shim.tsos << "XXXXX send_matrix: loadQuery is '" << loadQuery << "'" << std::endl; 
     }
-    std::string qid = executeQuery(shim, loadQuery);
+    qid = executeQuery(shim, loadQuery);
     if(shim.verbose) {
         shim.tsos << "@@@@@ send_matrix: input QID: " << qid << std::endl;
     }
@@ -499,10 +584,11 @@ std::string send_matrix(Shim& shim, const double* data, size_t nrow, size_t ncol
     //
     // TODO: drop session to drop uploaded file, or find way to do it explicitly
     //
+    // FACTOR
     if(shim.verbose) {
         shim.tsos << "@@@@@@ send_matrix: dropping session to release the uploaded file" << std::endl;
     }
-    std::string URL = shim.baseURL + "/release_session?id=" + shim.session ;
+    URL = shim.baseURL + "/release_session?id=" + shim.session ;
     doHTMLGetString(shim.curlHandle, URL, false); // nothing returned on a release
 
     shim.session  = doHTMLGetString(shim.curlHandle, shim.baseURL + "/new_session");
@@ -516,15 +602,15 @@ std::string send_matrix(Shim& shim, const double* data, size_t nrow, size_t ncol
             if(shim.verbose) {
                 shim.tsos << "@@@@@ send_matrix: CHECK A " << c << " : issuing scan of the uploaded matrix" << std::endl;
             }
-            scan_matrix(shim, "TMPLOAD123", "(double)");
+            scan_matrix(shim, "TMPLOAD123", scalarName);
 
-            double checkData[CHECK_DATA_SIZE];
-            memset(checkData, 0, nrow*ncol*sizeof(double));
+            scalar_tt checkData[CHECK_DATA_SIZE];
+            memset(checkData, 0, nrow*ncol*sizeof(scalar_tt));
             readBytesMatrix(shim, checkData, nrow, ncol); 
             if(shim.verbose) {
                 shim.tsos << "@@@@@ send_matrix: check A " << c << ": results received" << std::endl;
             }
-            if(memcmp(data, checkData, nrow*ncol*sizeof(double))) {
+            if(memcmp(data, checkData, nrow*ncol*sizeof(scalar_tt))) {
                 shim.tsos << "@@@@@ send_matrix: check A " << c << ": results differ" << std::endl;
                 for(size_t i =0; i < nrow*ncol; i++) {
                     if (data[i] != checkData[i]) {
@@ -560,7 +646,8 @@ std::string send_matrix(Shim& shim, const double* data, size_t nrow, size_t ncol
     // (or more control over the reshape)
     //
     char reshapeQuery[1000];
-    sprintf(reshapeQuery, "store(reshape(TMPLOAD123,<v:double>[r=0:%ld-1,1000,0,c=0:%ld-1,1000,0]),%s)", nrow, ncol, resultName.c_str());
+    sprintf(reshapeQuery, "store(reshape(TMPLOAD123,<v:%s>[r=0:%ld-1,1000,0,c=0:%ld-1,1000,0]),%s)",
+                           scalarName, nrow, ncol, resultName.c_str());
     if(shim.verbose) {
         shim.tsos << "XXXXX send_matrix: reshapeQuery is '" << reshapeQuery << "'" << std::endl; 
     }
@@ -588,14 +675,14 @@ std::string send_matrix(Shim& shim, const double* data, size_t nrow, size_t ncol
         if(shim.verbose) {
             shim.tsos << "@@@@@ send_matrix: CHECK2: issuing scan of the reshaped  matrix" << std::endl;
         }
-        scan_matrix(shim, resultName, "(double)");
-        double checkData[CHECK_DATA_SIZE];
-        memset(checkData, 0, nrow*ncol*sizeof(double));
+        scan_matrix(shim, resultName, scalarName);
+        scalar_tt checkData[CHECK_DATA_SIZE];
+        memset(checkData, 0, nrow*ncol*sizeof(scalar_tt));
         readBytesMatrix(shim, checkData, nrow, ncol); 
         if(shim.verbose) {
             shim.tsos << "@@@@@ send_matrix: check2 results received" << std::endl;
         }
-        if(memcmp(data, checkData, nrow*ncol*sizeof(double))) {
+        if(memcmp(data, checkData, nrow*ncol*sizeof(scalar_tt))) {
             shim.tsos << "@@@@@ send_matrix: check2 results differ" << std::endl;
             for(size_t i =0; i < nrow*ncol; i++) {
                 if (data[i] != checkData[i]) {
@@ -651,15 +738,16 @@ std::string send_matrix(Shim& shim, const double* data, size_t nrow, size_t ncol
 //
 // TODO: or should this generate the string, but not execute it?
 //
+template<typename scalar_tt>
 void queryGemm(Shim& shim, const std::string& nameA, const std::string& nameB, const std::string& nameC,
-                           bool transA, bool transB, double alpha, double beta,
-                           const std::string& storeArrayName, const std::string& saveFormat)
+                           bool transA, bool transB, scalar_tt alpha, scalar_tt beta,
+                           const std::string& storeArrayName, const std::string& scalarName)
 {
-    if (storeArrayName.size() && saveFormat.size()) {
-        throw std::runtime_error("queryGemm: only one of storeArrayName and saveFormat may be specified");
+    if (storeArrayName.size() && scalarName.size()) {
+        throw std::runtime_error("queryGemm: only one of storeArrayName and scalarName may be specified");
     }
-    if (storeArrayName.size() + saveFormat.size() == 0) {
-        throw std::runtime_error("queryGemm: storeArrayName or saveFormat must be specified");
+    if (storeArrayName.size() + scalarName.size() == 0) {
+        throw std::runtime_error("queryGemm: storeArrayName or scalarName must be specified");
         // not 100% true, it would run, but what would be the value of not recording the answer
     }
 
@@ -681,9 +769,31 @@ void queryGemm(Shim& shim, const std::string& nameA, const std::string& nameB, c
         std::cerr << "XXXXX ********************** FAILED to add the required RESHAPE to get the data to come back in order ********************" << std::endl;
     }
 
-    ss << "gemm(" << nameA << "," << nameB << "," << nameC ;
-    ss << ",'TRANSA=" << int(transA) << ";TRANSB=" << int(transB); 
-    ss << ";ALPHA=" << alpha << ";BETA=" << beta << "')";
+    //
+    // there is no gemm for float.  if scalarName == "float"
+    // then we need to use project(apply()) to increase array to double precision.
+    // and we need to do the reverse at the end
+    // NOTE: we could have a fgemm macro that woudl do this
+    std::string exprA = nameA;
+    std::string exprB = nameB;
+    std::string exprC = nameC;
+    if (scalarName == std::string("float")) {
+        exprA = "project(apply(" + nameA + ",vDbl,double(v)), vDbl)" ;
+        exprB = "project(apply(" + nameB + ",vDbl,double(v)), vDbl)" ;
+        exprC = "project(apply(" + nameC + ",vDbl,double(v)), vDbl)" ;
+    }
+
+    std::stringstream gg;
+    gg << "gemm(" << exprA << "," << exprB << "," << exprC ;
+    gg << ",'TRANSA=" << int(transA) << ";TRANSB=" << int(transB); 
+    gg << ";ALPHA=" << alpha << ";BETA=" << beta << "')";
+
+    if (scalarName == std::string("float")) {
+        ss << "project(apply(" << gg.str() << ", vFlt, float(gemm)), vFlt)";
+    } else {
+        ss << gg.str();
+    }
+
     //
     // TODO: close the reshape
     //
@@ -694,7 +804,7 @@ void queryGemm(Shim& shim, const std::string& nameA, const std::string& nameB, c
     if(shim.verbose) {
         std::cerr << "XXXXX queryGemm: gemmQuery is '" << ss.str() << "'" << std::endl; 
     }
-    std::string qid = executeQuery(shim, ss.str(), saveFormat);
+    std::string qid = executeQuery(shim, ss.str(), scalarName);
 }
 
 //
@@ -824,13 +934,16 @@ bool boolFromTransposeFlag(char flag)
 }
 
 
+template<typename scalar_tt>
 void dgemmScidbServer(const char& TRANSA, const char& TRANSB,
                       long M, long N, long K,
-                      double ALPHA, const double* aData, long LDA,
-                                    const double* bData, long LDB,
-                      double BETA,        double* cData, long LDC,
+                      scalar_tt ALPHA, const scalar_tt* aData, long LDA,
+                                       const scalar_tt* bData, long LDB,
+                      scalar_tt BETA,        scalar_tt* cData, long LDC,
                       Shim& shim)
 {
+    const char* scalarName=typeStr(aData[0]);
+
     if(shim.verbose) {
         shim.tsos << "TIMING dgemmScidbServer: Start" << std::endl;
         shim.tsos << "TIMING dgemmScidbServer: TRANSA:" << TRANSA << " TRANSB: " << TRANSB << std::endl; 
@@ -843,6 +956,16 @@ void dgemmScidbServer(const char& TRANSA, const char& TRANSB,
     std::string qid = executeQuery(shim, "load_library('dense_linear_algebra')");
     if(shim.verbose) {
         shim.tsos << "TIMING dgemmScidbServer: load_library('dense_linear_algebra') done" << std::endl;
+    }
+    // FACTOR
+    if(shim.verbose) {
+        shim.tsos << "@@@@@@ dgemmScidbServer: dropping load_library session" << std::endl;
+    }
+    std::string URL = shim.baseURL + "/release_session?id=" + shim.session ;
+    doHTMLGetString(shim.curlHandle, URL, false); // nothing returned on a release
+    shim.session  = doHTMLGetString(shim.curlHandle, shim.baseURL + "/new_session");
+    if(shim.verbose) {
+        shim.tsos << "@@@@@@ dgemmScidbServer: new session: " << shim.session << std::endl;
     }
 
     bool transA=(boolFromTransposeFlag(TRANSA));
@@ -880,19 +1003,28 @@ void dgemmScidbServer(const char& TRANSA, const char& TRANSB,
         shim.tsos << "TIMING dgemmScidbServer: B sent" << std::endl;
     }
 
-    std::string cName = send_matrix(shim, cData, cRow, cCol, "TMPC");
-    if(shim.verbose) {
-        shim.tsos << "TIMING dgemmScidbServer: C sent" << std::endl;
+    std::string cName;
+    if(BETA==0) {
+        // TODO, make analogue that does not send any data
+        cName = create_temp_matrix(shim, cRow, cCol, "TMPC", scalarName);
+        if(shim.verbose) {
+            shim.tsos << "TIMING dgemmScidbServer: C created empty" << std::endl;
+        }
+    } else {
+        cName = send_matrix(shim, cData, cRow, cCol, "TMPC");
+        if(shim.verbose) {
+            shim.tsos << "TIMING dgemmScidbServer: C sent" << std::endl;
+        }
     }
 
     bool debugUsingShow=false;
     if(debugUsingShow) {
-        scan_matrix(shim, aName, "(double)");
+        scan_matrix(shim, aName, scalarName);
         if(shim.verbose) {
             shim.tsos << "TIMING dgemmScidbServer: scan_matrix called" << std::endl;
         }
     } else {
-        queryGemm(shim, aName, bName, cName, transA, transB, /*alpha*/ALPHA, /*beta*/BETA, "", "(double)");
+        queryGemm(shim, aName, bName, cName, transA, transB, /*alpha*/ALPHA, /*beta*/BETA, "", scalarName);
         // answer should be
         // [22.5 49.5]
         // [28.5 64.5]
@@ -928,10 +1060,13 @@ void dgemmScidbServer(const char& TRANSA, const char& TRANSB,
 // follows and compile this file as the entire program
 //
 
-int mainTest()
+template<typename scalar_tt>
+int mainTest(scalar_tt value)
 {
     Shim& shim = getShim();     // with active session
     shim.verbose= true;         // timed tracing
+
+    const char* scalarName=typeStr(value);
 
 
     std::cerr << "main: dense_linear_algebra loaded" << std::endl;
@@ -942,7 +1077,7 @@ int mainTest()
     // fake data:
     const size_t aRow = 2;
     const size_t aCol = 3;
-    double aData[aRow*aCol];
+    scalar_tt aData[aRow*aCol];
     for(size_t i=0; i < aRow*aCol; i++) {
         aData[i] = 1+i ;
     }
@@ -950,7 +1085,7 @@ int mainTest()
 
     const size_t bRow = 3;
     const size_t bCol = 2;
-    double bData[bRow*bCol];
+    scalar_tt bData[bRow*bCol];
     for(size_t i=0; i < bRow*bCol; i++) {
         bData[i] = 1+i ;
     }
@@ -958,7 +1093,7 @@ int mainTest()
 
     const size_t cRow = 2;
     const size_t cCol = 2;
-    double cData[cRow*cCol];
+    scalar_tt cData[cRow*cCol];
     for(size_t i=0; i < cRow*cCol; i++) {
         cData[i] = 1 ; 
     }
@@ -985,12 +1120,12 @@ int mainTest()
         // TODO: when send_matrix done, change this to 3 different arrays
         bool transA=false;
         bool transB=false;
-        // run query outputting in binary doubles that can be retrieved with /read_bytes
+        // run query outputting in binary scalar_tt that can be retrieved with /read_bytes
         bool debugWithShow=false;
         if(debugWithShow) {
-            scan_matrix(shim, aName, "(double)");
+            scan_matrix(shim, aName, scalarName);
         } else {
-            queryGemm(shim, aName, bName, cName, transA, transB, /*alpha*/1.0, /*beta*/0.5, "", "(double)");
+            queryGemm(shim, aName, bName, cName, transA, transB, /*alpha*/1.0, /*beta*/0.5, "", scalarName);
             // answer should be
             // [22.5 49.5]
             // [28.5 64.5]
@@ -1046,7 +1181,13 @@ int mainTest()
 //
 // uncomment the following to turn this into a self-test program
 //
-// int main() { return scidb::mainTest(); }
+#if 0
+int main() {
+    int a = scidb::mainTest(0.0f);
+    int b = scidb::mainTest(0.0);
+    return a+b;
+}
+#endif
 
 namespace caffe {
 
@@ -1072,7 +1213,8 @@ char charFromCblasTrans(CBLAS_TRANSPOSE flag)
     }
 }
 
-bool significantDifference(double cData[], double cCheck[], size_t numVals)
+template<typename scalar_tt>
+bool significantDifference(scalar_tt cData[], scalar_tt cCheck[], size_t numVals)
 {
     for(size_t i =0; i < numVals; i++) {
         if (abs(cData[i] - cCheck[i]) > 1e-10 ) { // TODO: fix this to be relative error
@@ -1082,7 +1224,8 @@ bool significantDifference(double cData[], double cCheck[], size_t numVals)
     return false;
 }
 
-void dumpError(scidb::TimeStampedStream& tsos, const double* data, size_t nRow, size_t nCol, const std::string& label)
+template<typename scalar_tt>
+void dumpError(scidb::TimeStampedStream& tsos, const scalar_tt* data, size_t nRow, size_t nCol, const std::string& label)
 {
     tsos << "caffe_scidb_gemm error: " << label << " nRow " << nRow << " nCol " << nCol << std::endl;
     
@@ -1091,31 +1234,85 @@ void dumpError(scidb::TimeStampedStream& tsos, const double* data, size_t nRow, 
     }
 }
 
-template<>
-void caffe_scidb_gemm<double>(const CBLAS_TRANSPOSE TransA, const CBLAS_TRANSPOSE TransB,
-                              const int M, const int N, const int K,
-                              const double alpha, const double* aData, const int& lda,
-                                                  const double* bData, const int& ldb, const double beta,
-                                                        double* cData, const int& ldc)
-{
-    if (M*N*K <= 4e5) {  // TODO: provide a way to tune this value
-        // local will be faster
-        cblas_dgemm(CblasRowMajor,
-                    TransA, TransB, M, N, K,
-                    alpha, aData, lda,
-                           bData, ldb,
-                    beta,  cData, N);
-        return;
-    }
+template<typename scalar_tt>
+void cblas_gemm(const CBLAS_ORDER CblasRowMajor, CBLAS_TRANSPOSE TransA, const CBLAS_TRANSPOSE TransB,
+                 const int M, const int N, const int K,
+                 const scalar_tt alpha, const scalar_tt* aData, const int& lda,
+                                        const scalar_tt* bData, const int& ldb, const scalar_tt beta,
+                 scalar_tt* cData, const int& ldc);
 
+template<>
+void cblas_gemm<float>(const CBLAS_ORDER CblasRowMajor, CBLAS_TRANSPOSE TransA, const CBLAS_TRANSPOSE TransB,
+                       const int M, const int N, const int K,
+                       const float alpha, const float* aData, const int& lda,
+                                          const float* bData, const int& ldb, const float beta,
+                       float* cData, const int& ldc)
+{
+    cblas_sgemm(CblasRowMajor, TransA, TransB, M, N, K, alpha, aData, lda, bData, ldb, beta, cData, N);
+}
+
+template<>
+void cblas_gemm<double>(const CBLAS_ORDER CblasRowMajor, CBLAS_TRANSPOSE TransA, const CBLAS_TRANSPOSE TransB,
+                        const int M, const int N, const int K,
+                        const double alpha, const double* aData, const int& lda,
+                                            const double* bData, const int& ldb, const double beta,
+                        double* cData, const int& ldc)
+{
+    cblas_dgemm(CblasRowMajor, TransA, TransB, M, N, K, alpha, aData, lda, bData, ldb, beta, cData, N);
+}
+
+template<typename scalar_tt>
+void caffe_scidb_gemm(const CBLAS_TRANSPOSE TransA, const CBLAS_TRANSPOSE TransB,
+                      const int M, const int N, const int K,
+                      const scalar_tt alpha, const scalar_tt* aData, const int& lda,
+                                             const scalar_tt* bData, const int& ldb, const scalar_tt beta,
+                                                   scalar_tt* cData, const int& ldc)
+{
     //
     // get connection to SciDB
     // if its down, should we use the cblas?
     //
     scidb::Shim& shim = scidb::getShim();     // with active session
+
+    // set verbosity
     shim.verbose=bool(getenv("SCIDB_SHIM_TRACE"));       // traces the major steps
 
+    // set checking (vs cblas)
     shim.check=  bool(getenv("SCIDB_SHIM_CHECK"));
+
+    // set size limit past which gemm is sent to scidb
+    // (since the overhead is too high for small gemms
+    // set at 10M flops (assume machine does at lest 10Mflops/sec)
+    // and query will take at least one second
+    // but we will often need to lower this limit when testing for correctness
+    // so it can be adjusted by environment variable
+    long localLimit=10*1000*1000; // 10M by default
+    const char* limitStr = getenv("SCIDB_SHIM_GEMM_LIMIT");
+    if(limitStr) {
+        localLimit = atol(limitStr);
+    }
+
+    bool doTiming = bool(getenv("SCIDB_SHIM_TIME"));
+
+    // env SCIDB_SHIM_URL was not set
+    // or if the matrix is small enough
+    if (shim.baseURL.size()==0 || M*N*K <= localLimit) {
+        // local will be faster
+        double start = scidb::getsecs();
+        cblas_gemm(CblasRowMajor,
+                   TransA, TransB, M, N, K,
+                    alpha, aData, lda,
+                           bData, ldb,
+                    beta,  cData, N);
+        double end = scidb::getsecs();
+        // NOCHECKIN ... resolve the && next line
+        if(doTiming /*&& M*N*K >= localLimit/10*/ ) { // only print in the magnitude of localLimit
+            shim.tsos << "caffe_scidb_gemm: cblas: "<<M<<" * "<<K<<" * "<<N<<" , " << end-start << " s, "
+                      << 1e-6*M*K*N/(end-start) << " MFLOP/s" << std::endl; 
+        }
+        return;
+    }
+
 
     if(shim.verbose) {
         shim.tsos << "caffe_scidb_gemm: alpha  " << alpha  << " beta   " << beta    << std::endl; 
@@ -1128,10 +1325,10 @@ void caffe_scidb_gemm<double>(const CBLAS_TRANSPOSE TransA, const CBLAS_TRANSPOS
 
     // pre execution, have to save C when checking
     const int MAX_CHECK=1024;
-    double cDataCopy[MAX_CHECK];
+    scalar_tt cDataCopy[MAX_CHECK];
     if (shim.check && (M*N <= MAX_CHECK)) {
         // save a copy of cData for the check calculation
-        memcpy(cDataCopy, cData, M*N*sizeof(double));
+        memcpy(cDataCopy, cData, M*N*sizeof(scalar_tt));
     }
 
     //
@@ -1139,6 +1336,7 @@ void caffe_scidb_gemm<double>(const CBLAS_TRANSPOSE TransA, const CBLAS_TRANSPOS
     //       when it is completely zero
     //
     {
+        double start = scidb::getsecs();
         // without tranpositions, A is MxK, B is KxN, and C is MxN (row major)
         // not yet clear what lda, ldb, ldc should be
         // int lda = (TransA == CblasNoTrans) ? M : K;  // correct order?
@@ -1150,6 +1348,11 @@ void caffe_scidb_gemm<double>(const CBLAS_TRANSPOSE TransA, const CBLAS_TRANSPOS
                                      bData, ldb /*K?*/,
                                 beta, cData, ldc /*N?*/,
                                 shim);
+        double end = scidb::getsecs();
+        if(doTiming) {
+            shim.tsos << "caffe_scidb_gemm: scidb: "<<M<<" * "<<K<<" * "<<N<<" , " << end-start << " s, "
+                      << 1e-6*M*K*N/(end-start) << " MFLOP/s" << std::endl; 
+        }
     }
             
     if (shim.check && (M*N <= MAX_CHECK)) { // TODO: see below should this policy be in here or where called from caffe_{cpu,gpu}_gemm
@@ -1164,14 +1367,14 @@ void caffe_scidb_gemm<double>(const CBLAS_TRANSPOSE TransA, const CBLAS_TRANSPOS
         // if an exception is raised?
         //int lda = (TransA == CblasNoTrans) ? K : M; // reverse
         //int ldb = (TransB == CblasNoTrans) ? N : K; // reverse
-        double cCheck[MAX_CHECK];
-        memcpy(cCheck, cDataCopy, M*N*sizeof(double));
+        scalar_tt cCheck[MAX_CHECK];
+        memcpy(cCheck, cDataCopy, M*N*sizeof(scalar_tt));
 
-        cblas_dgemm(CblasRowMajor,
-                    TransA, TransB, M, N, K,
-                    alpha, aData, lda,
-                           bData, ldb,
-                    beta,  cCheck, N);
+        cblas_gemm(CblasRowMajor,
+                   TransA, TransB, M, N, K,
+                   alpha, aData, lda,
+                          bData, ldb,
+                   beta,  cCheck, N);
 
         // TODO now compare original cData with cDataCheck
 
@@ -1208,16 +1411,19 @@ void caffe_scidb_gemm<double>(const CBLAS_TRANSPOSE TransA, const CBLAS_TRANSPOS
     } 
 }
 
-template<>
-void caffe_scidb_gemm<float>(const CBLAS_TRANSPOSE TransA, const CBLAS_TRANSPOSE TransB,
+// force instantiation since template not exposed to caller
+template
+void caffe_scidb_gemm<float >(const CBLAS_TRANSPOSE, const CBLAS_TRANSPOSE,
                               const int M, const int N, const int K,
-                              const float alpha, const float* aData, const int& lda,
-                                                  const float* bData, const int& ldb, const float beta,
-                                                        float* cData, const int& ldc)
-{
-    abort();
-    cblas_sgemm(CblasRowMajor, TransA, TransB, M, N, K,
-                 alpha, aData, lda, bData, ldb, beta, cData, N);
-}
+                              const float  alpha, const float * aData, const int& lda,
+                                                  const float * bData, const int& ldb, const float  beta,
+                                                        float * cData, const int& ldc);
+template
+void caffe_scidb_gemm<double>(const CBLAS_TRANSPOSE, const CBLAS_TRANSPOSE,
+                              const int M, const int N, const int K,
+                              const double alpha, const double* aData, const int& lda,
+                                                  const double* bData, const int& ldb, const double beta,
+                                                        double* cData, const int& ldc);
+
 
 }  // namespace caffe
