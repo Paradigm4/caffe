@@ -598,47 +598,45 @@ std::string send_matrix(Shim& shim, const scalar_tt* data, size_t nrow, size_t n
 
     const int CHECK_DATA_SIZE=1200;
     if(shim.check && (nrow * ncol <= CHECK_DATA_SIZE)) {
-        for(size_t c=0; c < 1; c++) {   // NOCHECKIN: remove this loop
-            if(shim.verbose) {
-                shim.tsos << "@@@@@ send_matrix: CHECK A " << c << " : issuing scan of the uploaded matrix" << std::endl;
-            }
-            scan_matrix(shim, "TMPLOAD123", scalarName);
+        if(shim.verbose) {
+            shim.tsos << "@@@@@ send_matrix: CHECK A : issuing scan of the uploaded matrix" << std::endl;
+        }
+        scan_matrix(shim, "TMPLOAD123", scalarName);
 
-            scalar_tt checkData[CHECK_DATA_SIZE];
-            memset(checkData, 0, nrow*ncol*sizeof(scalar_tt));
-            readBytesMatrix(shim, checkData, nrow, ncol); 
+        scalar_tt checkData[CHECK_DATA_SIZE];
+        memset(checkData, 0, nrow*ncol*sizeof(scalar_tt));
+        readBytesMatrix(shim, checkData, nrow, ncol); 
+        if(shim.verbose) {
+            shim.tsos << "@@@@@ send_matrix: check A : results received" << std::endl;
+        }
+        if(memcmp(data, checkData, nrow*ncol*sizeof(scalar_tt))) {
+            shim.tsos << "@@@@@ send_matrix: check A : results differ" << std::endl;
+            for(size_t i =0; i < nrow*ncol; i++) {
+                if (data[i] != checkData[i]) {
+                    shim.tsos << "@@@@@ data["<<i<<"]=" << data[i] << " checkData["<<i<<"]=" << checkData[i] << std::endl;
+                }
+            }
+        } else {
             if(shim.verbose) {
-                shim.tsos << "@@@@@ send_matrix: check A " << c << ": results received" << std::endl;
+                shim.tsos << "TIMING send_matrix: check A : passed" << std::endl;
             }
-            if(memcmp(data, checkData, nrow*ncol*sizeof(scalar_tt))) {
-                shim.tsos << "@@@@@ send_matrix: check A " << c << ": results differ" << std::endl;
-                for(size_t i =0; i < nrow*ncol; i++) {
-                    if (data[i] != checkData[i]) {
-                        shim.tsos << "@@@@@ data["<<i<<"]=" << data[i] << " checkData["<<i<<"]=" << checkData[i] << std::endl;
-                    }
-                }
-            } else {
-                if(shim.verbose) {
-                    shim.tsos << "TIMING send_matrix: check A " << c << ": passed" << std::endl;
-                }
-            }
+        }
 
-            // FACTOR
-            {
-                if(shim.verbose) {
-                    shim.tsos << "@@@@@@ send_matrix: releasing session from last check A: " << shim.session << std::endl;
-                }
-                std::string URL = shim.baseURL + "/release_session?id=" + shim.session ;
-                doHTMLGetString(shim.curlHandle, URL, false); // nothing returned on a release
-                shim.session  = doHTMLGetString(shim.curlHandle, shim.baseURL + "/new_session");
-                if(shim.verbose) {
-                    shim.tsos << "@@@@@@ send_matrix: new session for next query: " << shim.session << std::endl;
-                }
+        // FACTOR
+        {
+            if(shim.verbose) {
+                shim.tsos << "@@@@@@ send_matrix: releasing session from last check A: " << shim.session << std::endl;
             }
-        } // for
+            std::string URL = shim.baseURL + "/release_session?id=" + shim.session ;
+            doHTMLGetString(shim.curlHandle, URL, false); // nothing returned on a release
+            shim.session  = doHTMLGetString(shim.curlHandle, shim.baseURL + "/new_session");
+            if(shim.verbose) {
+                shim.tsos << "@@@@@@ send_matrix: new session for next query: " << shim.session << std::endl;
+            }
+        }
     } // if
 
-    //
+//
     // reshape to rectangular from a simple vector of data
     // NOTE: this interprets the linear stream of data as row-major, which is useful for c-style matrices.
     // if this C++ code were to be used from, e.g. R, Fortran, (Python/Numpy?), then we would
@@ -1293,6 +1291,7 @@ void caffe_scidb_gemm(const CBLAS_TRANSPOSE TransA, const CBLAS_TRANSPOSE TransB
     }
 
     bool doTiming = bool(getenv("SCIDB_SHIM_TIME"));
+    double secsToPrintLimit = atof(getenv("SCIDB_SHIM_TIME"));
 
     // env SCIDB_SHIM_URL was not set
     // or if the matrix is small enough
@@ -1304,11 +1303,20 @@ void caffe_scidb_gemm(const CBLAS_TRANSPOSE TransA, const CBLAS_TRANSPOSE TransB
                     alpha, aData, lda,
                            bData, ldb,
                     beta,  cData, N);
-        double end = scidb::getsecs();
-        // NOCHECKIN ... resolve the && next line
-        if(doTiming /*&& M*N*K >= localLimit/10*/ ) { // only print in the magnitude of localLimit
-            shim.tsos << "caffe_scidb_gemm: cblas: "<<M<<" * "<<K<<" * "<<N<<" , " << end-start << " s, "
-                      << 1e-6*M*K*N/(end-start) << " MFLOP/s" << std::endl; 
+        double secs = scidb::getsecs() - start;
+        static bool dotsNeedNewline=false;
+        if (doTiming) {
+            if(secs >= secsToPrintLimit) {
+                if(dotsNeedNewline) {
+                    std::cerr << std::endl;
+                    dotsNeedNewline=true;
+                }
+                shim.tsos << "caffe_scidb_gemm: cblas: "<<M<<" * "<<K<<" * "<<N<<" , " << secs << " s, "
+                          << 1e-6*M*K*N/secs << " MFLOP/s" << std::endl; 
+            } else {
+                std::cerr << "." ;
+                dotsNeedNewline=true;
+            }
         }
         return;
     }
