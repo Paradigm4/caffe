@@ -844,7 +844,7 @@ Shim& getShim()
 }
 
 //
-// helper for dgemmScidbServer
+// helper for gemmScidbServer
 //
 bool boolFromTransposeFlag(char flag)
 {
@@ -863,27 +863,27 @@ bool boolFromTransposeFlag(char flag)
 
 
 template<typename scalar_tt>
-void dgemmScidbServer(const char& TRANSA, const char& TRANSB,
-                      long M, long N, long K,
-                      scalar_tt ALPHA, const scalar_tt* aData, long LDA,
-                                       const scalar_tt* bData, long LDB,
-                      scalar_tt BETA,        scalar_tt* cData, long LDC,
-                      Shim& shim)
+void gemmScidbServer(const char& TRANSA, const char& TRANSB,
+                     long M, long N, long K,
+                     scalar_tt ALPHA, const scalar_tt* aData, long LDA,
+                                      const scalar_tt* bData, long LDB,
+                     scalar_tt BETA,        scalar_tt* cData, long LDC,
+                     Shim& shim, bool doTiming)
 {
     const char* scalarName=typeStr(aData[0]);
 
     if(shim.verbose) {
-        shim.tsos << "TIMING dgemmScidbServer: Start" << std::endl;
-        shim.tsos << "TIMING dgemmScidbServer: TRANSA:" << TRANSA << " TRANSB: " << TRANSB << std::endl; 
-        shim.tsos << "TIMING dgemmScidbServer: ALPHA: " << ALPHA  << " BETA:   " << BETA << std::endl; 
-        shim.tsos << "TIMING dgemmScidbServer: M:     " << M      << " N:      " << N    << " K:      " << K << std::endl; 
-        shim.tsos << "TIMING dgemmScidbServer: LDA:   " << LDA    << " LDB:    " << LDB  << " LDC:    " << LDC << std::endl; 
+        shim.tsos << "TIMING gemmScidbServer: Start" << std::endl;
+        shim.tsos << "TIMING gemmScidbServer: TRANSA:" << TRANSA << " TRANSB: " << TRANSB << std::endl; 
+        shim.tsos << "TIMING gemmScidbServer: ALPHA: " << ALPHA  << " BETA:   " << BETA << std::endl; 
+        shim.tsos << "TIMING gemmScidbServer: M:     " << M      << " N:      " << N    << " K:      " << K << std::endl; 
+        shim.tsos << "TIMING gemmScidbServer: LDA:   " << LDA    << " LDB:    " << LDB  << " LDC:    " << LDC << std::endl; 
     }
 
     // load dense linear algebra for dgemm
     std::string qid = executeQuery(shim, "load_library('dense_linear_algebra')");
     if(shim.verbose) {
-        shim.tsos << "TIMING dgemmScidbServer: load_library('dense_linear_algebra') done" << std::endl;
+        shim.tsos << "TIMING gemmScidbServer: load_library('dense_linear_algebra') done" << std::endl;
     }
     new_session(shim);
 
@@ -905,71 +905,82 @@ void dgemmScidbServer(const char& TRANSA, const char& TRANSB,
     //      2. catch them here to print them
     //      3. return the name of the result (text "handle"
     if(shim.verbose) {
-        shim.tsos << "TIMING dgemmScidbServer: calling sendMatrix()" << std::endl;
+        shim.tsos << "gemmScidbServer: calling send_matrix()" << std::endl;
     }
 
     //
     // TODO: generate unique temporary names, e.g. GUID-based
     //
     
+    double start = getsecs();
     std::string aName = send_matrix(shim, aData, aRow, aCol, "TMPA");
-    if(shim.verbose) {
-        shim.tsos << "TIMING dgemmScidbServer: A sent" << std::endl;
+    double secs = getsecs() - start;
+    if(doTiming || shim.verbose) {
+        shim.tsos << "gemmScidbServer send_matrix A: " << secs << " s" << std::endl;
     }
 
+    start = getsecs();
     std::string bName = send_matrix(shim, bData, bRow, bCol, "TMPB");
-    if(shim.verbose) {
-        shim.tsos << "TIMING dgemmScidbServer: B sent" << std::endl;
+    secs = getsecs() - start;
+    if(doTiming || shim.verbose) {
+        shim.tsos << "gemmScidbServer send_matrix B: " << secs << " s" << std::endl;
     }
 
     std::string cName;
     if(BETA==0) {
         // TODO, make analogue that does not send any data
+        double start = getsecs();
         cName = create_temp_matrix(shim, cRow, cCol, "TMPC", scalarName);
-        if(shim.verbose) {
-            shim.tsos << "TIMING dgemmScidbServer: C created empty" << std::endl;
+        double secs = getsecs() - start;
+        if(doTiming || shim.verbose) {
+            shim.tsos << "gemmScidbServer create empty C : " << secs << " s" << std::endl;
         }
     } else {
+        double start = getsecs();
         cName = send_matrix(shim, cData, cRow, cCol, "TMPC");
-        if(shim.verbose) {
-            shim.tsos << "TIMING dgemmScidbServer: C sent" << std::endl;
+        double secs = getsecs() - start;
+        if(doTiming || shim.verbose) {
+            shim.tsos << "gemmScidbServer send_matrix C: " << secs << " s" << std::endl;
         }
     }
 
-    bool debugUsingShow=false;
-    if(debugUsingShow) {
-        scan_matrix(shim, aName, scalarName);
-        if(shim.verbose) {
-            shim.tsos << "TIMING dgemmScidbServer: scan_matrix called" << std::endl;
+    // run the query
+    {
+        double start = getsecs();
+        bool debugUsingShow=false;
+        if(debugUsingShow) {
+            scan_matrix(shim, aName, scalarName);
+            if(shim.verbose) {
+                shim.tsos << "gemmScidbServer: scan_matrix called" << std::endl;
+            }
+        } else {
+            queryGemm(shim, aName, bName, cName, transA, transB, /*alpha*/ALPHA, /*beta*/BETA, "", scalarName);
+            // answer should be
+            // [22.5 49.5]
+            // [28.5 64.5]
+            if(shim.verbose) {
+                shim.tsos << "TIMING gemmScidbServer: queryGemm called" << std::endl;
+            }
         }
-    } else {
-        queryGemm(shim, aName, bName, cName, transA, transB, /*alpha*/ALPHA, /*beta*/BETA, "", scalarName);
-        // answer should be
-        // [22.5 49.5]
-        // [28.5 64.5]
-        if(shim.verbose) {
-            shim.tsos << "TIMING dgemmScidbServer: queryGemm called" << std::endl;
-        }
-    }
 
-    //and read the output back into an array
-    readBytesMatrix(shim, cData, cRow, cCol); 
-    if(shim.verbose) {
-        shim.tsos << "TIMING dgemmScidbServer: results received" << std::endl;
+        //and read the output back into an array
+        readBytesMatrix(shim, cData, cRow, cCol); 
+        double secs = getsecs() - start;
+        if(doTiming || shim.verbose) {
+            shim.tsos << "gemmScidbServer query executed and results received: " << secs << " s" << std::endl;
+        }
     }
 
     // and remove the arrays
-    qid = executeQuery(shim, "remove(TMPA)");
-    if(shim.verbose) {
-        shim.tsos << "@@@@@ remove QID: " << qid << std::endl;
-    }
-    qid = executeQuery(shim, "remove(TMPB)");
-    if(shim.verbose) {
-        shim.tsos << "@@@@@ remove QID: " << qid << std::endl;
-    }
-    qid = executeQuery(shim, "remove(TMPC)");
-    if(shim.verbose) {
-        shim.tsos << "@@@@@ remove QID: " << qid << std::endl;
+    {
+        double start = getsecs();
+        qid = executeQuery(shim, "remove(TMPA)");
+        qid = executeQuery(shim, "remove(TMPB)");
+        qid = executeQuery(shim, "remove(TMPC)");
+        double secs = getsecs() - start;
+        if(doTiming || shim.verbose) {
+            shim.tsos << "gemmScidbServer removed A,B,C in: " << secs << " s" << std::endl;
+        }
     }
 }
 
@@ -984,6 +995,7 @@ int mainTest(scalar_tt value)
 {
     Shim& shim = getShim();     // with active session
     shim.verbose= true;         // timed tracing
+    bool doTiming=true;
 
     const char* scalarName=typeStr(value);
 
@@ -1063,13 +1075,13 @@ int mainTest(scalar_tt value)
         // REMOVE UNITA, UNITB, UNITC
     }
 
-    shim.tsos << "main: calling dgemmScidbServer" << std::endl;
+    shim.tsos << "main: calling gemmScidbServer" << std::endl;
 
-    dgemmScidbServer('N', 'N', aRow, bCol, bRow,
-                      1.0, aData, /*LDA*/aRow,
-                           bData, /*LDB*/bRow,
-                      0.5, cData, /*LDC*/cRow,
-                      shim);
+    gemmScidbServer('N', 'N', aRow, bCol, bRow,
+                     1.0, aData, /*LDA*/aRow,
+                          bData, /*LDB*/bRow,
+                     0.5, cData, /*LDC*/cRow,
+                     shim, doTiming);
 
     for(size_t i=0; i< cRow*cCol; i++) {
         shim.tsos << "dgemm result["<<i<<"] = " << cData[i] << std::endl;
@@ -1082,11 +1094,11 @@ int mainTest(scalar_tt value)
         cData[i] = 1 ; 
     }
 
-    dgemmScidbServer('N', 'N', aRow, bCol, bRow,
-                      1.0, aData, /*LDA*/aRow,
-                           bData, /*LDB*/bRow,
-                      0.1, cData, /*LDC*/cRow,
-                      shim);
+    gemmScidbServer('N', 'N', aRow, bCol, bRow,
+                     1.0, aData, /*LDA*/aRow,
+                          bData, /*LDB*/bRow,
+                     0.1, cData, /*LDC*/cRow,
+                     shim, doTiming);
 
     for(size_t i=0; i< cRow*cCol; i++) {
         shim.tsos << "dgemm result["<<i<<"] = " << cData[i] << std::endl;
@@ -1271,12 +1283,12 @@ void caffe_scidb_gemm(const CBLAS_TRANSPOSE TransA, const CBLAS_TRANSPOSE TransB
         // int lda = (TransA == CblasNoTrans) ? M : K;  // correct order?
         // int ldb = (TransB == CblasNoTrans) ? K : N;
         // int ldc = N;
-        scidb::dgemmScidbServer(charFromCblasTrans(TransA), charFromCblasTrans(TransB),
-                                M, N, K,
-                                alpha, aData, lda /*M?*/, 
-                                     bData, ldb /*K?*/,
-                                beta, cData, ldc /*N?*/,
-                                shim);
+        scidb::gemmScidbServer(charFromCblasTrans(TransA), charFromCblasTrans(TransB),
+                               M, N, K,
+                               alpha, aData, lda /*M?*/, 
+                                      bData, ldb /*K?*/,
+                               beta,  cData, ldc /*N?*/,
+                               shim,  doTiming);
         double secs = scidb::getsecs() - start;
         if(doTiming) {
             if(secs >= secsToPrintLimit) {
