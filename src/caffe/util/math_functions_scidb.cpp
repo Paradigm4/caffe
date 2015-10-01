@@ -380,6 +380,22 @@ void scan_matrix(Shim& shim, const std::string& nameA, const std::string& scalar
 }
 
 //
+// newSession
+//
+void new_session(Shim& shim)
+{
+    if(shim.verbose) {
+        shim.tsos << "new_session: releasing " << shim.session << std::endl;
+    }
+    std::string URL = shim.baseURL + "/release_session?id=" + shim.session ;
+    doHTMLGetString(shim.curlHandle, URL, false); // nothing returned on a release
+    shim.session  = doHTMLGetString(shim.curlHandle, shim.baseURL + "/new_session");
+    if(shim.verbose) {
+        shim.tsos << "new_session: acquired " << shim.session << std::endl;
+    }
+}
+
+//
 // API: create_temp_matrix
 //
 std::string create_temp_matrix(Shim& shim, size_t nrow, size_t ncol, const std::string& resultName, const std::string& scalarTypeName)
@@ -394,16 +410,8 @@ std::string create_temp_matrix(Shim& shim, size_t nrow, size_t ncol, const std::
     if(shim.verbose) {
         shim.tsos << "@@@@@ create_temp_matrix: input QID: " << qid << std::endl;
     }
-    // FACTOR
-    if(shim.verbose) {
-        shim.tsos << "@@@@@@ create_temp_matrix: dropping createQuery session" << std::endl;
-    }
-    std::string URL = shim.baseURL + "/release_session?id=" + shim.session ;
-    doHTMLGetString(shim.curlHandle, URL, false); // nothing returned on a release
-    shim.session  = doHTMLGetString(shim.curlHandle, shim.baseURL + "/new_session");
-    if(shim.verbose) {
-        shim.tsos << "@@@@@@ create_temp_matrix: new session: " << shim.session << std::endl;
-    }
+    new_session(shim); // can only be tested when Beta is 0
+
     return resultName;
 }
 
@@ -452,19 +460,8 @@ std::string send_matrix(Shim& shim, const scalar_tt* data, size_t nrow, size_t n
         shim.tsos << "XXXXX send_matrix: createLoadQuery is '" << createLoadQuery << "'" << std::endl; 
     }
     std::string qid = executeQuery(shim, createLoadQuery);
-    if(shim.verbose) {
-        shim.tsos << "@@@@@ send_matrix: input QID: " << qid << std::endl;
-    }
-    // FACTOR
-    if(shim.verbose) {
-        shim.tsos << "@@@@@@ send_matrix: dropping createLoadQuery session" << std::endl;
-    }
-    std::string URL = shim.baseURL + "/release_session?id=" + shim.session ;
-    doHTMLGetString(shim.curlHandle, URL, false); // nothing returned on a release
-    shim.session  = doHTMLGetString(shim.curlHandle, shim.baseURL + "/new_session");
-    if(shim.verbose) {
-        shim.tsos << "@@@@@@ send_matrix: new session: " << shim.session << std::endl;
-    }
+    if(shim.verbose) { shim.tsos << "@@@@@ send_matrix: input QID: " << qid << std::endl; }
+    // new_session(shim);
 
     char createReshapeQuery[1000];
     sprintf(createReshapeQuery, "create TEMP array %s <v:%s>[r=0:%ld-1,1000,0,c=0:%ld-1,1000,0]",
@@ -476,16 +473,7 @@ std::string send_matrix(Shim& shim, const scalar_tt* data, size_t nrow, size_t n
     if(shim.verbose) {
         shim.tsos << "@@@@@ send_matrix: input QID: " << qid << std::endl;
     }
-    // FACTOR
-    if(shim.verbose) {
-        shim.tsos << "@@@@@@ send_matrix: dropping createReshapeQuery session" << std::endl;
-    }
-    URL = shim.baseURL + "/release_session?id=" + shim.session ;
-    doHTMLGetString(shim.curlHandle, URL, false); // nothing returned on a release
-    shim.session  = doHTMLGetString(shim.curlHandle, shim.baseURL + "/new_session");
-    if(shim.verbose) {
-        shim.tsos << "@@@@@@ send_matrix: new session: " << shim.session << std::endl;
-    }
+    // new_session(shim);
 
     //
     // can factor this to doHTMLPost -- similar to doHTMLGetData?
@@ -584,17 +572,7 @@ std::string send_matrix(Shim& shim, const scalar_tt* data, size_t nrow, size_t n
     //
     // TODO: drop session to drop uploaded file, or find way to do it explicitly
     //
-    // FACTOR
-    if(shim.verbose) {
-        shim.tsos << "@@@@@@ send_matrix: dropping session to release the uploaded file" << std::endl;
-    }
-    URL = shim.baseURL + "/release_session?id=" + shim.session ;
-    doHTMLGetString(shim.curlHandle, URL, false); // nothing returned on a release
-
-    shim.session  = doHTMLGetString(shim.curlHandle, shim.baseURL + "/new_session");
-    if(shim.verbose) {
-        shim.tsos << "@@@@@@ send_matrix: new session: " << shim.session << std::endl;
-    }
+    new_session(shim);
 
     const int CHECK_DATA_SIZE=1200;
     if(shim.check && (nrow * ncol <= CHECK_DATA_SIZE)) {
@@ -621,19 +599,7 @@ std::string send_matrix(Shim& shim, const scalar_tt* data, size_t nrow, size_t n
                 shim.tsos << "TIMING send_matrix: check A : passed" << std::endl;
             }
         }
-
-        // FACTOR
-        {
-            if(shim.verbose) {
-                shim.tsos << "@@@@@@ send_matrix: releasing session from last check A: " << shim.session << std::endl;
-            }
-            std::string URL = shim.baseURL + "/release_session?id=" + shim.session ;
-            doHTMLGetString(shim.curlHandle, URL, false); // nothing returned on a release
-            shim.session  = doHTMLGetString(shim.curlHandle, shim.baseURL + "/new_session");
-            if(shim.verbose) {
-                shim.tsos << "@@@@@@ send_matrix: new session for next query: " << shim.session << std::endl;
-            }
-        }
+        // new_session(shim);
     } // if
 
 //
@@ -654,19 +620,7 @@ std::string send_matrix(Shim& shim, const scalar_tt* data, size_t nrow, size_t n
     if(shim.verbose) {
         shim.tsos << "@@@@@ send_matrix: reshape QID: " << qid << std::endl;
     }
-
-    // FACTOR
-    {
-        if(shim.verbose) {
-            shim.tsos << "@@@@@@ send_matrix: releasing session from store(reshape()): " << shim.session << std::endl;
-        }
-        std::string URL = shim.baseURL + "/release_session?id=" + shim.session ;
-        doHTMLGetString(shim.curlHandle, URL, false); // nothing returned on a release
-        shim.session  = doHTMLGetString(shim.curlHandle, shim.baseURL + "/new_session");
-        if(shim.verbose) {
-            shim.tsos << "@@@@@@ send_matrix: new session for next query: " << shim.session << std::endl;
-        }
-    }
+    new_session(shim); // without this one, we get errors
 
     // so lets check the info in the rectangular (resultName) array
     if(shim.check && (nrow * ncol <= CHECK_DATA_SIZE)) {
@@ -692,19 +646,7 @@ std::string send_matrix(Shim& shim, const scalar_tt* data, size_t nrow, size_t n
                 shim.tsos << "@@@@@ send_matrix: check2 passed" << std::endl;
             }
         }
-
-        // FACTOR
-        {
-            if(shim.verbose) {
-                shim.tsos << "@@@@@@ send_matrix: releasing session from scan [check2]: " << shim.session << std::endl;
-            }
-            std::string URL = shim.baseURL + "/release_session?id=" + shim.session ;
-            doHTMLGetString(shim.curlHandle, URL, false); // nothing returned on a release
-            shim.session  = doHTMLGetString(shim.curlHandle, shim.baseURL + "/new_session");
-            if(shim.verbose) {
-                shim.tsos << "@@@@@@ send_matrix: new session for next query: " << shim.session << std::endl;
-            }
-        }
+        // new_session(shim);
     }
     
     //
@@ -714,19 +656,7 @@ std::string send_matrix(Shim& shim, const scalar_tt* data, size_t nrow, size_t n
     if(shim.verbose) {
         shim.tsos << "@@@@@ remove QID: " << qid << std::endl;
     }
-
-    // FACTOR
-    {
-        if(shim.verbose) {
-            shim.tsos << "@@@@@@ send_matrix: releasing session from remove(TMPLOAD123): " << shim.session << std::endl;
-        }
-        std::string URL = shim.baseURL + "/release_session?id=" + shim.session ;
-        doHTMLGetString(shim.curlHandle, URL, false); // nothing returned on a release
-        shim.session  = doHTMLGetString(shim.curlHandle, shim.baseURL + "/new_session");
-        if(shim.verbose) {
-            shim.tsos << "@@@@@@ send_matrix: new session for next query: " << shim.session << std::endl;
-        }
-    }
+    new_session(shim);
 
     return resultName;
 }
@@ -955,16 +885,7 @@ void dgemmScidbServer(const char& TRANSA, const char& TRANSB,
     if(shim.verbose) {
         shim.tsos << "TIMING dgemmScidbServer: load_library('dense_linear_algebra') done" << std::endl;
     }
-    // FACTOR
-    if(shim.verbose) {
-        shim.tsos << "@@@@@@ dgemmScidbServer: dropping load_library session" << std::endl;
-    }
-    std::string URL = shim.baseURL + "/release_session?id=" + shim.session ;
-    doHTMLGetString(shim.curlHandle, URL, false); // nothing returned on a release
-    shim.session  = doHTMLGetString(shim.curlHandle, shim.baseURL + "/new_session");
-    if(shim.verbose) {
-        shim.tsos << "@@@@@@ dgemmScidbServer: new session: " << shim.session << std::endl;
-    }
+    new_session(shim);
 
     bool transA=(boolFromTransposeFlag(TRANSA));
     long aRow = (transA==false)? M : K;
@@ -1292,6 +1213,7 @@ void caffe_scidb_gemm(const CBLAS_TRANSPOSE TransA, const CBLAS_TRANSPOSE TransB
 
     bool doTiming = bool(getenv("SCIDB_SHIM_TIME"));
     double secsToPrintLimit = atof(getenv("SCIDB_SHIM_TIME"));
+    static bool dotsNeedNewline=false;
 
     // env SCIDB_SHIM_URL was not set
     // or if the matrix is small enough
@@ -1304,17 +1226,16 @@ void caffe_scidb_gemm(const CBLAS_TRANSPOSE TransA, const CBLAS_TRANSPOSE TransB
                            bData, ldb,
                     beta,  cData, N);
         double secs = scidb::getsecs() - start;
-        static bool dotsNeedNewline=false;
         if (doTiming) {
             if(secs >= secsToPrintLimit) {
                 if(dotsNeedNewline) {
                     std::cerr << std::endl;
                     dotsNeedNewline=true;
                 }
-                shim.tsos << "caffe_scidb_gemm: cblas: "<<M<<" * "<<K<<" * "<<N<<" , " << secs << " s, "
+                shim.tsos << "caffe_scidb_gemm: cblas: "<<M<<"*"<<K<<"*"<<N<<" beta " << beta << ", " << secs << " s, "
                           << 1e-6*M*K*N/secs << " MFLOP/s" << std::endl; 
             } else {
-                std::cerr << "." ;
+                std::cerr << "c" ;
                 dotsNeedNewline=true;
             }
         }
@@ -1356,10 +1277,19 @@ void caffe_scidb_gemm(const CBLAS_TRANSPOSE TransA, const CBLAS_TRANSPOSE TransB
                                      bData, ldb /*K?*/,
                                 beta, cData, ldc /*N?*/,
                                 shim);
-        double end = scidb::getsecs();
+        double secs = scidb::getsecs() - start;
         if(doTiming) {
-            shim.tsos << "caffe_scidb_gemm: scidb: "<<M<<" * "<<K<<" * "<<N<<" , " << end-start << " s, "
-                      << 1e-6*M*K*N/(end-start) << " MFLOP/s" << std::endl; 
+            if(secs >= secsToPrintLimit) {
+                if(dotsNeedNewline) {
+                    std::cerr << std::endl;
+                    dotsNeedNewline=true;
+                }
+                shim.tsos << "caffe_scidb_gemm: scidb: "<<M<<"*"<<K<<"*"<<N<<" beta " << beta << ", " << secs << " s, "
+                          << 1e-6*M*K*N/(secs) << " MFLOP/s" << std::endl; 
+            } else {
+                std::cerr << "s" ;
+                dotsNeedNewline=true;
+            }
         }
     }
             
