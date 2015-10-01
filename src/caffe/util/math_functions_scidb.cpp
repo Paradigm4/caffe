@@ -348,35 +348,39 @@ void readBytesMatrix(Shim& shim, scalar_tt* array, size_t nRow, size_t nCol)
 //
 // scan_matrix
 //
-void scan_matrix(Shim& shim, const std::string& nameA, const std::string& scalarName)
+void scan_matrix(Shim& shim, const std::string& nameA,
+                 const std::string& scalarName, size_t nRow, size_t nCol)
 {
-    if (scalarName.size() == 0) {
-        throw std::runtime_error("gemm: scalarName must be specified");
+    // scalarname is "float" or "double"
+    if (scalarName != std::string("float") &&
+        scalarName != std::string("double")) {
+        throw std::runtime_error("gemm: scalarName 'float' or 'double' required");
     }
 
     //
     // save and download?
     //
-    std::stringstream ss;
-    
-    // TODO:  MUST PUT a RESHAPE here as bryan told me so that
-    //        the array comes back streaming in the right order
-    //        actually the reshape here obviates the need for scan
-    //
-    if(shim.verbose) {
-        std::cerr << "XXXXX ********************** FAILED (scan_matrix) to add the required RESHAPE to get the data to come back in order ********************" << std::endl;
-    }
+    std::stringstream query;
 
-    ss << "scan(" << nameA << ")";
-    //
-    // TODO: close the reshape
-    //
+    // reshape to a a vector, this will serialize the data in row-major order
+    query << "reshape(";
+    
+    // the query itself is a scan if double
+    // or if float, have to project(apply()) to get it to double
+    if(scalarName == std::string("double")) {
+        query << "scan(" << nameA << ")";
+    } else {
+        query << "project(apply(" << nameA << ",vDbl,double(v)), vDbl)" ;
+    }
+    
+    // and close the reshape expression
+    query << ", <v:double>[i=0:"<<nRow*nCol<<"-1,1000,0])";
                                                   
     if(shim.verbose) {
-        std::cerr << "XXXXX scan_matrix query is '" << ss.str() << "'" << std::endl; 
+        std::cerr << "XXXXX scan_matrix query is '" << query.str() << "'" << std::endl; 
         std::cerr << "XXXXX scan_matrix scalarName is: " << scalarName << std::endl; 
     }
-    std::string qid = executeQuery(shim, ss.str(), scalarName);
+    std::string qid = executeQuery(shim, query.str(), scalarName);
 }
 
 //
@@ -579,7 +583,7 @@ std::string send_matrix(Shim& shim, const scalar_tt* data, size_t nrow, size_t n
         if(shim.verbose) {
             shim.tsos << "@@@@@ send_matrix: CHECK A : issuing scan of the uploaded matrix" << std::endl;
         }
-        scan_matrix(shim, "TMPLOAD123", scalarName);
+        scan_matrix(shim, "TMPLOAD123", scalarName, nrow, ncol);
 
         scalar_tt checkData[CHECK_DATA_SIZE];
         memset(checkData, 0, nrow*ncol*sizeof(scalar_tt));
@@ -627,7 +631,7 @@ std::string send_matrix(Shim& shim, const scalar_tt* data, size_t nrow, size_t n
         if(shim.verbose) {
             shim.tsos << "@@@@@ send_matrix: CHECK2: issuing scan of the reshaped  matrix" << std::endl;
         }
-        scan_matrix(shim, resultName, scalarName);
+        scan_matrix(shim, resultName, scalarName, nrow, ncol);
         scalar_tt checkData[CHECK_DATA_SIZE];
         memset(checkData, 0, nrow*ncol*sizeof(scalar_tt));
         readBytesMatrix(shim, checkData, nrow, ncol); 
@@ -669,7 +673,8 @@ std::string send_matrix(Shim& shim, const scalar_tt* data, size_t nrow, size_t n
 template<typename scalar_tt>
 void queryGemm(Shim& shim, const std::string& nameA, const std::string& nameB, const std::string& nameC,
                            bool transA, bool transB, scalar_tt alpha, scalar_tt beta,
-                           const std::string& storeArrayName, const std::string& scalarName)
+                           const std::string& storeArrayName,
+                           const std::string& scalarName, size_t cRow, size_t cCol)
 {
     if (storeArrayName.size() && scalarName.size()) {
         throw std::runtime_error("queryGemm: only one of storeArrayName and scalarName may be specified");
@@ -679,22 +684,23 @@ void queryGemm(Shim& shim, const std::string& nameA, const std::string& nameB, c
         // not 100% true, it would run, but what would be the value of not recording the answer
     }
 
-    if(shim.verbose) {
-        std::cerr << "XXXXX storeArrayName: '" << storeArrayName << "', .size(): " << storeArrayName.size() << std::endl;
-    }
 
     //
-    // save and download?
+    // start the query
     //
-    std::stringstream ss;
+    std::stringstream query;
     if (storeArrayName.size()) {                // storing option
-        ss << "store(" ;
-    }
-    // TODO:  MUST PUT a RESHAPE here as bryan told me so that
-    //        the array comes back streaming in the right order
-    //
-    if(shim.verbose) {
-        std::cerr << "XXXXX ********************** FAILED to add the required RESHAPE to get the data to come back in order ********************" << std::endl;
+        if(shim.verbose) {
+            std::cerr << "queryGemm storeArrayName: '" << storeArrayName
+                      << "', .size(): " << storeArrayName.size() << std::endl;
+        }
+        query << "store(" ;
+    } else {
+        //
+        // start a reshape to a 1D vector which forces the data to come back
+        // in row-major serialized order.
+        //
+        query << "reshape(";
     }
 
     //
@@ -711,28 +717,35 @@ void queryGemm(Shim& shim, const std::string& nameA, const std::string& nameB, c
         exprC = "project(apply(" + nameC + ",vDbl,double(v)), vDbl)" ;
     }
 
-    std::stringstream gg;
-    gg << "gemm(" << exprA << "," << exprB << "," << exprC ;
-    gg << ",'TRANSA=" << int(transA) << ";TRANSB=" << int(transB); 
-    gg << ";ALPHA=" << alpha << ";BETA=" << beta << "')";
+    //
+    // gemm portion of the query
+    //
+    std::stringstream gemmQuery;
+    gemmQuery << "gemm(" << exprA << "," << exprB << "," << exprC ;
+    gemmQuery << ",'TRANSA=" << int(transA) << ";TRANSB=" << int(transB); 
+    gemmQuery << ";ALPHA=" << alpha << ";BETA=" << beta << "')";
 
     if (scalarName == std::string("float")) {
-        ss << "project(apply(" << gg.str() << ", vFlt, float(gemm)), vFlt)";
+        query << "project(apply(" << gemmQuery.str() << ", vFlt, float(gemm)), vFlt)";
     } else {
-        ss << gg.str();
+        query << gemmQuery.str();
     }
 
     //
-    // TODO: close the reshape
+    // close the store or the reshape
     //
     if (storeArrayName.size()) {                // storing option
-        ss << "," << storeArrayName << ")";
+        // close the store
+        query << "," << storeArrayName << ")";
+    } else {
+        // close the reshape
+        query << ", <v:double>[i=0:"<<cRow*cCol<<"-1,1000,0])";
     }
-                                                  
     if(shim.verbose) {
-        std::cerr << "XXXXX queryGemm: gemmQuery is '" << ss.str() << "'" << std::endl; 
+        std::cerr << "XXXXX queryGemm: gemmQuery is '" << query.str() << "'" << std::endl; 
     }
-    std::string qid = executeQuery(shim, ss.str(), scalarName);
+
+    std::string qid = executeQuery(shim, query.str(), scalarName);
 }
 
 //
@@ -949,12 +962,12 @@ void gemmScidbServer(const char& TRANSA, const char& TRANSB,
         double start = getsecs();
         bool debugUsingShow=false;
         if(debugUsingShow) {
-            scan_matrix(shim, aName, scalarName);
+            scan_matrix(shim, aName, scalarName, cRow, cCol);
             if(shim.verbose) {
                 shim.tsos << "gemmScidbServer: scan_matrix called" << std::endl;
             }
         } else {
-            queryGemm(shim, aName, bName, cName, transA, transB, /*alpha*/ALPHA, /*beta*/BETA, "", scalarName);
+            queryGemm(shim, aName, bName, cName, transA, transB, /*alpha*/ALPHA, /*beta*/BETA, "", scalarName, cRow, cCol);
             // answer should be
             // [22.5 49.5]
             // [28.5 64.5]
@@ -1054,9 +1067,9 @@ int mainTest(scalar_tt value)
         // run query outputting in binary scalar_tt that can be retrieved with /read_bytes
         bool debugWithShow=false;
         if(debugWithShow) {
-            scan_matrix(shim, aName, scalarName);
+            scan_matrix(shim, aName, scalarName, cRow, cCol);
         } else {
-            queryGemm(shim, aName, bName, cName, transA, transB, /*alpha*/1.0, /*beta*/0.5, "", scalarName);
+            queryGemm(shim, aName, bName, cName, transA, transB, /*alpha*/1.0, /*beta*/0.5, "", scalarName, cRow, cCol);
             // answer should be
             // [22.5 49.5]
             // [28.5 64.5]
@@ -1244,8 +1257,10 @@ void caffe_scidb_gemm(const CBLAS_TRANSPOSE TransA, const CBLAS_TRANSPOSE TransB
                     std::cerr << std::endl;
                     dotsNeedNewline=true;
                 }
-                shim.tsos << "caffe_scidb_gemm: cblas: "<<M<<"*"<<K<<"*"<<N<<" beta " << beta << ", " << secs << " s, "
-                          << 1e-6*M*K*N/secs << " MFLOP/s" << std::endl; 
+                shim.tsos << "caffe_scidb_gemm: cblas: " << scidb::typeStr(aData[0])
+                          << " " << M << "*" << K << "*" << N
+                          << " beta " << beta << ", " << secs << " s, "
+                          << 1e-6*M*K*N/(secs) << " MFLOP/s" << std::endl; 
             } else {
                 std::cerr << "c" ;
                 dotsNeedNewline=true;
@@ -1296,7 +1311,9 @@ void caffe_scidb_gemm(const CBLAS_TRANSPOSE TransA, const CBLAS_TRANSPOSE TransB
                     std::cerr << std::endl;
                     dotsNeedNewline=true;
                 }
-                shim.tsos << "caffe_scidb_gemm: scidb: "<<M<<"*"<<K<<"*"<<N<<" beta " << beta << ", " << secs << " s, "
+                shim.tsos << "caffe_scidb_gemm: scidb: " << scidb::typeStr(aData[0])
+                          << " " << M << "*" << K << "*" << N
+                          << " beta " << beta << ", " << secs << " s, "
                           << 1e-6*M*K*N/(secs) << " MFLOP/s" << std::endl; 
             } else {
                 std::cerr << "s" ;
