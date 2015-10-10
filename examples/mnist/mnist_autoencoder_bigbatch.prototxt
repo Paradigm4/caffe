@@ -1,4 +1,4 @@
-name: "MNISTAutoencoder"
+name: "MNISTAutoencoderBigBatch"
 layer {
   name: "data"
   type: "Data"
@@ -11,7 +11,7 @@ layer {
   }
   data_param {
     source: "examples/mnist/mnist_train_lmdb"
-    batch_size: 1600   # original 100 x 16
+    batch_size: 15000    # original 100 x 16
     backend: LMDB
   }
 }
@@ -27,8 +27,8 @@ layer {
     scale: 0.0039215684
   }
   data_param {
-    source: "examples/mnist/mnist_train_lmdb"
-    batch_size: 1600   # original 100 x 16
+    source: "./examples/mnist/mnist_train_lmdb"
+    batch_size: 15000    # original 100 x 16
     backend: LMDB
   }
 }
@@ -45,7 +45,7 @@ layer {
   }
   data_param {
     source: "examples/mnist/mnist_test_lmdb"
-    batch_size: 1600  # original 100 x 16
+    batch_size: 15000    # original 100 x 16
     backend: LMDB
   }
 }
@@ -69,7 +69,7 @@ layer {
     decay_mult: 0
   }
   inner_product_param {
-    num_output: 1000   # original 1000
+    num_output: 15001   # original 1000 x 20
     weight_filler {
       type: "gaussian"
       std: 1
@@ -101,7 +101,7 @@ layer {
     decay_mult: 0
   }
   inner_product_param {
-    num_output: 500     # original 500
+    num_output: 15002     # original 500 x 40
     weight_filler {
       type: "gaussian"
       std: 1
@@ -133,7 +133,7 @@ layer {
     decay_mult: 0
   }
   inner_product_param {
-    num_output: 250     # original 250
+    num_output: 253     # original 250 x 1
     weight_filler {
       type: "gaussian"
       std: 1
@@ -191,7 +191,7 @@ layer {
     decay_mult: 0
   }
   inner_product_param {
-    num_output: 250           # original 250
+    num_output: 254     # original 250 x 1
     weight_filler {
       type: "gaussian"
       std: 1
@@ -223,7 +223,7 @@ layer {
     decay_mult: 0
   }
   inner_product_param {
-    num_output: 500     # original 500
+    num_output: 505     # original 500 x 1
     weight_filler {
       type: "gaussian"
       std: 1
@@ -255,7 +255,7 @@ layer {
     decay_mult: 0
   }
   inner_product_param {
-    num_output: 1000    # original 1000
+    num_output: 1006    # original 1000 x 1
     weight_filler {
       type: "gaussian"
       std: 1
@@ -287,7 +287,7 @@ layer {
     decay_mult: 0
   }
   inner_product_param {
-    num_output: 784     # original 784
+    num_output: 784     # original
     weight_filler {
       type: "gaussian"
       std: 1

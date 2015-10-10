@@ -1,9 +1,9 @@
 net: "examples/mnist/mnist_autoencoder_bigbatch.prototxt"
 test_state: { stage: 'test-on-train' }
-test_iter: 500
+test_iter: 50
 test_state: { stage: 'test-on-test' }
-test_iter: 100
-test_interval: 500
+test_iter: 10
+test_interval: 50
 test_compute_loss: true
 base_lr: 0.01
 lr_policy: "step"
@@ -16,4 +16,4 @@ snapshot: 10000
 snapshot_prefix: "examples/mnist/mnist_autoencoder_bigbatch"
 momentum: 0.9
 # solver mode: CPU or GPU
-solver_mode: GPU
+solver_mode: CPU
