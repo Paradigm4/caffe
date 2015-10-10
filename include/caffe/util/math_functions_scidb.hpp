@@ -112,10 +112,10 @@ namespace caffe {
 
 template <class Dtype>
 void caffe_scidb_gemm(const CBLAS_TRANSPOSE TransA, const CBLAS_TRANSPOSE TransB,
-                      const int M, const int N, const int K,
-                      const Dtype alpha, const Dtype* aData, const int& lda,
-                                         const Dtype* bData, const int& ldb, const Dtype beta,
-                                               Dtype* cData, const int& ldc);
+                      const long M, const long N, const long K,
+                      const Dtype alpha, const Dtype* aData, const long& lda,
+                                         const Dtype* bData, const long& ldb, const Dtype beta,
+                                               Dtype* cData, const long& ldc);
 
 // NOTE: specializations for double and float are located
 // in the cpp file

@@ -245,7 +245,7 @@ std::string doHTMLGetString(CURL* easyHandle, const std::string& URL, bool resul
     // TODO: possbile that whitespace trimming should be option-controlled
 
     if (cerrDebug && resultExpected) {
-            std::cerr << "[cerrDebug] doHTMLGetString, received string is: " << receivedStr << std::endl; 
+        std::cerr << "[cerrDebug] doHTMLGetString, received string is: " << receivedStr << std::endl; 
     }
     return receivedStr;
 }
@@ -437,6 +437,9 @@ template<> const char* typeStr<double>(double val) { return "double";}
 template<typename scalar_tt>
 std::string send_matrix(Shim& shim, const scalar_tt* data, size_t nrow, size_t ncol, const std::string& resultName)
 {
+    if(shim.verbose) {
+        shim.tsos << "[verbose] send_matrix: entered" << std::endl; 
+    }
     const char* scalarName=typeStr(data[0]);
 
     //
@@ -596,7 +599,7 @@ std::string send_matrix(Shim& shim, const scalar_tt* data, size_t nrow, size_t n
     //
     new_session(shim);
 
-    const int CHECK_DATA_SIZE=1200;
+    const int CHECK_DATA_SIZE=1000*1000;
     if(shim.check && (nrow * ncol <= CHECK_DATA_SIZE)) {
         if(shim.verbose) {
             shim.tsos << "[verbose] send_matrix: CHECK A : issuing scan of the uploaded matrix" << std::endl;
@@ -604,7 +607,7 @@ std::string send_matrix(Shim& shim, const scalar_tt* data, size_t nrow, size_t n
         scan_matrix(shim, "TMPLOAD123", scalarName, nrow, ncol);
 
         scalar_tt checkData[CHECK_DATA_SIZE];
-        memset(checkData, 0, nrow*ncol*sizeof(scalar_tt));
+        memset(checkData, 0, nrow*ncol*sizeof(scalar_tt));      // optional
         readBytesMatrix(shim, checkData, nrow, ncol); 
         if(shim.verbose) {
             shim.tsos << "[verbose] send_matrix: check A : results received" << std::endl;
@@ -740,7 +743,7 @@ void queryGemm(Shim& shim, const std::string& nameA, const std::string& nameB, c
     //
     std::stringstream gemmQuery;
     gemmQuery << "gemm(" << exprA << "," << exprB << "," << exprC ;
-    gemmQuery << ",'TRANSA=" << int(transA) << ";TRANSB=" << int(transB); 
+    gemmQuery << ",'TRANSA=" << long(transA) << ";TRANSB=" << long(transB); 
     gemmQuery << ";ALPHA=" << alpha << ";BETA=" << beta << "')";
 
     if (scalarName == std::string("float")) {
@@ -935,43 +938,40 @@ void gemmScidbServer(const char& TRANSA, const char& TRANSB,
     //      1. change errors to exceptions in send_matrix
     //      2. catch them here to print them
     //      3. return the name of the result (text "handle"
-    if(shim.verbose) {
-        shim.tsos << "gemmScidbServer: calling send_matrix()" << std::endl;
-    }
 
     //
     // TODO: generate unique temporary names, e.g. GUID-based
     //
-    
+
     double start = getsecs();
     std::string aName = send_matrix(shim, aData, aRow, aCol, "TMPA");
     double secs = getsecs() - start;
     if(doTiming || shim.verbose) {
-        shim.tsos << "gemmScidbServer send_matrix A: " << secs << " s" << std::endl;
+        shim.tsos << "gemmScidbServer send_matrix A: " <<aRow<< " x " <<aCol<< " " <<secs<< " s" << std::endl;
     }
 
     start = getsecs();
     std::string bName = send_matrix(shim, bData, bRow, bCol, "TMPB");
     secs = getsecs() - start;
     if(doTiming || shim.verbose) {
-        shim.tsos << "gemmScidbServer send_matrix B: " << secs << " s" << std::endl;
+        shim.tsos << "gemmScidbServer send_matrix B: " <<bRow<< " x " <<bCol<< " " <<secs<< " s" << std::endl;
     }
 
     std::string cName;
-    if(BETA==0) {
+    if(BETA==0.0) {
         // TODO, make analogue that does not send any data
         double start = getsecs();
         cName = create_temp_matrix(shim, cRow, cCol, "TMPC", scalarName);
         double secs = getsecs() - start;
         if(doTiming || shim.verbose) {
-            shim.tsos << "gemmScidbServer create empty C : " << secs << " s" << std::endl;
+            shim.tsos << "gemmScidbServer create empty C: " <<cRow<< " x " <<cCol<< " " <<secs<< " s" << std::endl;
         }
     } else {
         double start = getsecs();
         cName = send_matrix(shim, cData, cRow, cCol, "TMPC");
         double secs = getsecs() - start;
         if(doTiming || shim.verbose) {
-            shim.tsos << "gemmScidbServer send_matrix C: " << secs << " s" << std::endl;
+            shim.tsos << "gemmScidbServer send_matrix C: " <<cRow<< " x " <<cCol<< " " <<secs<< " s" << std::endl;
         }
     }
 
@@ -1070,13 +1070,13 @@ int mainTest(scalar_tt value)
         //      2. catch them here to print them
         //      3. return the name of the result (text "handle"
         shim.tsos << "unit_test main calling send_matrix(,aData," << aRow << " x " << aCol << ",)" << std::endl;
-        std::string aName = send_matrix(shim, aData, aRow, aCol, "UNITA");
+        std::string aName = send_matrix<scalar_tt>(shim, aData, aRow, aCol, "UNITA");
 
         shim.tsos << "unit_test main calling send_matrix(,bData," << bRow << " x " << bCol << ",)" << std::endl;
-        std::string bName = send_matrix(shim, bData, bRow, bCol, "UNITB");
+        std::string bName = send_matrix<scalar_tt>(shim, bData, bRow, bCol, "UNITB");
 
         shim.tsos << "unit_test main calling send_matrix(,bData," << cRow << " x " << cCol << ",)" << std::endl;
-        std::string cName = send_matrix(shim, cData, cRow, cCol, "UNITC");
+        std::string cName = send_matrix<scalar_tt>(shim, cData, cRow, cCol, "UNITC");
 
         // need 1 to 3 arrays
         // TODO: when send_matrix done, change this to 3 different arrays
@@ -1176,10 +1176,10 @@ char charFromCblasTrans(CBLAS_TRANSPOSE flag)
 }
 
 template<typename scalar_tt>
-bool significantDifference(scalar_tt cData[], scalar_tt cCheck[], size_t numVals)
+bool significantDifference(scalar_tt cData[], scalar_tt cResultBlas[], size_t numVals)
 {
     for(size_t i =0; i < numVals; i++) {
-        if (abs(cData[i] - cCheck[i]) > 1e-10 ) { // TODO: fix this to be relative error
+        if (abs(cData[i] - cResultBlas[i]) > 1e-10 ) { // TODO: fix this to be relative error
             return true;
         }
     }
@@ -1225,19 +1225,25 @@ void cblas_gemm<double>(const CBLAS_ORDER CblasRowMajor, CBLAS_TRANSPOSE TransA,
 
 template<typename scalar_tt>
 void caffe_scidb_gemm(const CBLAS_TRANSPOSE TransA, const CBLAS_TRANSPOSE TransB,
-                      const int M, const int N, const int K,
-                      const scalar_tt alpha, const scalar_tt* aData, const int& lda,
-                                             const scalar_tt* bData, const int& ldb, const scalar_tt beta,
-                                                   scalar_tt* cData, const int& ldc)
+                      const long M, const long N, const long K,
+                      const scalar_tt alpha, const scalar_tt* aData, const long& lda,
+                                             const scalar_tt* bData, const long& ldb, const scalar_tt beta,
+                                                   scalar_tt* cData, const long& ldc)
 {
+
     //
     // get connection to SciDB
     // if its down, should we use the cblas?
     //
     scidb::Shim& shim = scidb::getShim();     // with active session
 
+    //
     // set verbosity
+    //
     shim.verbose=bool(getenv("SCIDB_SHIM_TRACE"));       // traces the major steps
+    if(shim.verbose) {
+        shim.tsos << "caffe_scidb_gemm: entered type: " << scidb::typeStr(aData[0]) << std::endl;
+    }
 
     // set checking (vs cblas)
     shim.check=  bool(getenv("SCIDB_SHIM_CHECK"));
@@ -1255,12 +1261,18 @@ void caffe_scidb_gemm(const CBLAS_TRANSPOSE TransA, const CBLAS_TRANSPOSE TransB
     }
 
     bool doTiming = bool(getenv("SCIDB_SHIM_TIME"));
-    double secsToPrintLimit = atof(getenv("SCIDB_SHIM_TIME"));
+
+    double secsToPrintLimit = 0.0;
+    const char* doTimingStr = getenv("SCIDB_SHIM_TIME");
+    if (doTimingStr) {
+        secsToPrintLimit = atof(doTimingStr);
+    }
+
     static bool dotsNeedNewline=false;
 
     // env SCIDB_SHIM_URL was not set
     // or if the matrix is small enough
-    if (shim.baseURL.size()==0 || M*N*K <= localLimit) {
+    if(shim.baseURL.size()==0 || M*N*K <= localLimit) {
         // local will be faster
         double start = scidb::getsecs();
         cblas_gemm(CblasRowMajor,
@@ -1295,14 +1307,31 @@ void caffe_scidb_gemm(const CBLAS_TRANSPOSE TransA, const CBLAS_TRANSPOSE TransB
         shim.tsos << "caffe_scidb_gemm: lda    " << lda    << " ldb    " << ldb    << " ldc    " << ldc << std::endl; 
     }
 
-
-
     // pre execution, have to save C when checking
-    const int MAX_CHECK=100*1024;
-    scalar_tt cDataCopy[MAX_CHECK];
-    if (shim.check && (M*N <= MAX_CHECK)) {
+    // using a big stack array causes debugging problems
+    // (they may not expect frame offsets to be larger than 16 or 32 bit?
+    // so as a workaround, we new the array whenever it is smaller
+    // than the M*N requested.  We keep it in a static
+    // since its goign to be used over and over.
+    // note we never bother to free it... this is for debuggging only
+    static size_t cDataSize=0;
+    static scalar_tt* cOriginal = NULL; // original C
+    static scalar_tt* cResultBlas = NULL; // C' computed by BLAS as a check against SciDB
+
+    if(shim.check && (M*N > cDataSize)) {
+        if(cOriginal) { delete[] cOriginal; }
+        if(cResultBlas) { delete[] cResultBlas; }
+        cDataSize=M*N;
+        cOriginal = new scalar_tt[cDataSize];
+        cResultBlas = new scalar_tt[cDataSize];
+        shim.tsos << "caffe_scidb_gemm: cDataSize increased to " << cDataSize <<std::endl;
+    }
+    if (shim.check) {
+        assert(M*N <= cDataSize);
+        assert(cOriginal);
+        assert(cResultBlas);
         // save a copy of cData for the check calculation
-        memcpy(cDataCopy, cData, M*N*sizeof(scalar_tt));
+        memcpy(cOriginal, cData, M*N*sizeof(cOriginal[0]));
     }
 
     //
@@ -1314,9 +1343,9 @@ void caffe_scidb_gemm(const CBLAS_TRANSPOSE TransA, const CBLAS_TRANSPOSE TransB
         double start = scidb::getsecs();
         // without tranpositions, A is MxK, B is KxN, and C is MxN (row major)
         // not yet clear what lda, ldb, ldc should be
-        // int lda = (TransA == CblasNoTrans) ? M : K;  // correct order?
-        // int ldb = (TransB == CblasNoTrans) ? K : N;
-        // int ldc = N;
+        // long lda = (TransA == CblasNoTrans) ? M : K;  // correct order?
+        // long ldb = (TransB == CblasNoTrans) ? K : N;
+        // long ldc = N;
         scidb::gemmScidbServer(charFromCblasTrans(TransA), charFromCblasTrans(TransB),
                                M, N, K,
                                alpha, aData, lda /*M?*/, 
@@ -1324,7 +1353,7 @@ void caffe_scidb_gemm(const CBLAS_TRANSPOSE TransA, const CBLAS_TRANSPOSE TransB
                                beta,  cData, ldc /*N?*/,
                                shim,  doTiming);
         double secs = scidb::getsecs() - start;
-        if(doTiming) {
+        if(doTiming || shim.check) {            // NOCHECKIN: experiment, print timing when checking
             if(secs >= secsToPrintLimit) {
                 if(dotsNeedNewline) {
                     std::cerr << std::endl;
@@ -1342,7 +1371,7 @@ void caffe_scidb_gemm(const CBLAS_TRANSPOSE TransA, const CBLAS_TRANSPOSE TransB
         }
     }
             
-    if (shim.check && (M*N <= MAX_CHECK)) { // TODO: see below should this policy be in here or where called from caffe_{cpu,gpu}_gemm
+    if (shim.check) { // TODO: see below should this policy be in here or where called from caffe_{cpu,gpu}_gemm
         if(shim.verbose) {
             shim.tsos << "caffe_scidb_gemm: checking" << std::endl;
         }
@@ -1352,28 +1381,27 @@ void caffe_scidb_gemm(const CBLAS_TRANSPOSE TransA, const CBLAS_TRANSPOSE TransB
         // or should caffe_cpu_gemm() and caffe_gpu_gemm()
         // both try scidb_dgemm() first and fall back
         // if an exception is raised?
-        //int lda = (TransA == CblasNoTrans) ? K : M; // reverse
-        //int ldb = (TransB == CblasNoTrans) ? N : K; // reverse
-        scalar_tt cCheck[MAX_CHECK];
-        memcpy(cCheck, cDataCopy, M*N*sizeof(scalar_tt));
+        //long lda = (TransA == CblasNoTrans) ? K : M; // reverse
+        //long ldb = (TransB == CblasNoTrans) ? N : K; // reverse
+        memcpy(cResultBlas, cOriginal, M*N*sizeof(scalar_tt));
 
         double start = scidb::getsecs();
         cblas_gemm(CblasRowMajor,
                    TransA, TransB, M, N, K,
                    alpha, aData, lda,
                           bData, ldb,
-                   beta,  cCheck, N);
+                   beta,  cResultBlas, N);
         double secs = scidb::getsecs() - start;
         if(timingPrinted) {
             shim.tsos << "caffe_scidb_gemm: cblas check: " << scidb::typeStr(aData[0])
-                      << " " << M << "*" << K << "*" << N
+                      << " MKN: " << M << "*" << K << "*" << N
                       << " beta " << beta << ", " << secs << " s, "
                       << 1e-6*M*K*N/(secs) << " MFLOP/s" << std::endl; 
         }
 
         // TODO now compare original cData with cDataCheck
 
-        if(significantDifference(cData, cCheck, M*N)) {
+        if(significantDifference(cData, cResultBlas, M*N)) {
             // they differ
             shim.tsos << "ERROR caffe_scidb_gemm: ------------------------------" << std::endl;
             shim.tsos << "ERROR caffe_scidb_gemm: not same result as cblas_dgemm"    << std::endl;
@@ -1390,12 +1418,12 @@ void caffe_scidb_gemm(const CBLAS_TRANSPOSE TransA, const CBLAS_TRANSPOSE TransB
             dumpError(shim.tsos, bData, K, N, "bData");
             shim.tsos << "ERROR caffe_scidb_gemm:                                          " << std::endl;
 
-            dumpError(shim.tsos, cDataCopy, M, N, "cDataCopy -- original");
+            dumpError(shim.tsos, cOriginal, M, N, "cOriginal -- original");
             shim.tsos << "ERROR caffe_scidb_gemm:                                          " << std::endl;
 
             for(size_t i =0; i < M*N; i++) {
-                if (abs(cData[i] - cCheck[i]) > 1e-10 ) {
-                    shim.tsos << "ERROR cData["<<i<<"]=" << cData[i] << " != cCheck["<<i<<"]=" << cCheck[i] << std::endl;
+                if (abs(cData[i] - cResultBlas[i]) > 1e-10 ) {
+                    shim.tsos << "ERROR cData["<<i<<"]=" << cData[i] << " != cResultBlas["<<i<<"]=" << cResultBlas[i] << std::endl;
                 }
             }
         } else {
@@ -1409,16 +1437,16 @@ void caffe_scidb_gemm(const CBLAS_TRANSPOSE TransA, const CBLAS_TRANSPOSE TransB
 // force instantiation since template not exposed to caller
 template
 void caffe_scidb_gemm<float >(const CBLAS_TRANSPOSE, const CBLAS_TRANSPOSE,
-                              const int M, const int N, const int K,
-                              const float  alpha, const float * aData, const int& lda,
-                                                  const float * bData, const int& ldb, const float  beta,
-                                                        float * cData, const int& ldc);
+                              const long M, const long N, const long K,
+                              const float  alpha, const float * aData, const long& lda,
+                                                  const float * bData, const long& ldb, const float  beta,
+                                                        float * cData, const long& ldc);
 template
 void caffe_scidb_gemm<double>(const CBLAS_TRANSPOSE, const CBLAS_TRANSPOSE,
-                              const int M, const int N, const int K,
-                              const double alpha, const double* aData, const int& lda,
-                                                  const double* bData, const int& ldb, const double beta,
-                                                        double* cData, const int& ldc);
+                              const long M, const long N, const long K,
+                              const double alpha, const double* aData, const long& lda,
+                                                  const double* bData, const long& ldb, const double beta,
+                                                        double* cData, const long& ldc);
 
 
 }  // namespace caffe
