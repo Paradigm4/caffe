@@ -73,8 +73,12 @@ struct Shim {
     /*const*/ CURL*   curlHandle;       // underlying libcurl can't handle this being const
     const std::string baseURL;
     std::string       session;
-    bool              verbose;
+    float             timing;           // special, limited verbosity
+    bool              verbose;          // more verbosity, generally for trace debugging
     bool              check;
+    bool              lazyEval;         // return query strings rather
+                                        // than the name of an array
+                                        // containing the result
     TimeStampedStream tsos;
 
     Shim(CURL* curlHandle_, const std::string& baseURL_, const std::string& session_, std::ostream& os)
@@ -82,6 +86,7 @@ struct Shim {
     curlHandle(curlHandle_),
     baseURL(baseURL_),
     session(session_),
+    timing(1.f/0.f),            // infinity so everything is "too fast to print" by default
     verbose(false),
     check(false),
     tsos(os)

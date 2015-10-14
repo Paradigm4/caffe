@@ -1,3 +1,4 @@
+#include <cmath>       // fplassify et. al.
 #include <cstring>
 #include <iomanip>
 #include <iostream>
@@ -15,12 +16,14 @@
 
 #include "caffe/util/math_functions_scidb.hpp"
 
+
 namespace scidb {
 
 //
 // timing helpers
 //
 
+// for implementing getsecs()
 double clock_getsecs(long clock)
 {
     struct timespec timeSpec;
@@ -29,6 +32,7 @@ double clock_getsecs(long clock)
     return double(timeSpec.tv_sec) + 1e-9*timeSpec.tv_nsec;
 }
 
+// to use in code
 double getsecs()
 {
     return clock_getsecs(CLOCK_MONOTONIC_RAW);
@@ -45,51 +49,60 @@ double getsecs()
 //
 // a detailed debug function (the built in one doesn't show what is sent)
 //
+// TODO: user userp to indicate if the
+// data currently expected is ascii or floats or doubles or unknown
+// and fix the "unknown printabilty" below
 int my_trace(CURL *handle, curl_infotype type, const char *data, size_t size, void *userp)
 {
+    static size_t counter=0;
+    counter++;
+
     const char *infoTypeText = NULL;
-    std::string printString("[not printable]");
+    std::string printString("");
     bool printEndl = true;
 
     switch (type) {
     default: /* in case a new one is introduced to shock us */
         return 0;
     case CURLINFO_TEXT:
-        // infoTypeText = "== Info: " ;
+        infoTypeText = "== Info, " ;
         printString = std::string(data, size);
         printEndl = false;
         break;
     case CURLINFO_HEADER_OUT:
-        infoTypeText = "=> Send header";
+        infoTypeText = "=> Send header,";
         printString = std::string(data, size);
         printEndl = false;
         break;
     case CURLINFO_DATA_OUT:
-        infoTypeText = "=> Send data";
+        infoTypeText = "=> Send data,";
         break;
      case CURLINFO_SSL_DATA_OUT:
-        infoTypeText = "=> Send SSL data";
+        infoTypeText = "=> Send SSL data,";
         break;
      case CURLINFO_HEADER_IN:
-        infoTypeText = "<= Recv header";
+        infoTypeText = "<= Recv header,";
         printString = std::string(data, size);
-        printEndl = false;
         break;
      case CURLINFO_DATA_IN:
-        infoTypeText = "<= Recv data";
+        infoTypeText = "<= Recv data,";
         break;
      case CURLINFO_SSL_DATA_IN:
-        infoTypeText = "<= Recv SSL data";
+        infoTypeText = "<= Recv SSL data,";
         break;
    }
 
    if(infoTypeText) {
-       std::cerr << "@ " << infoTypeText << " " << size << " b" << std::endl;
+       std::cerr << counter << ". " << infoTypeText << " " << size << "b:"; 
    }
-   std::cerr << "@ " << printString ;
-   if (printEndl) {
-       std::cerr << std::endl;
+   if(printString.size()>0) {
+       std::cerr << " [[" << printString << "]]" << std::endl;
+   } else {
+       std::cerr << " ??"<< std::endl;
    }
+   //if (printEndl) {
+       //std::cerr << std::endl;
+   //}
    return 0;
 }
  
@@ -127,91 +140,379 @@ size_t receiveString(char *bufptr, size_t size, size_t nitems, void * userp)
     return bytesConsumed; // how much consumed, not how much returned
 }
 
+const bool DoReshape=false ;// expermental, use reshape to reorder
+                            // the data rather than the receiving code
+                            // suggested by Bryan, but it performs poorly
+                            // setting it to false which enables code
+                            // that re-orders the data on the client
+                            // side.
+                            // NOTE this is possible because my case
+                            // is strictly dense ... in Bryan's case
+                            // according to Alex, getting the vector
+                            // is one way to determine its dense.
+
 //
 // and another for receiving binary data
 //
-struct RecvStuff {
-    char *       recvData;
-    size_t       bufSize;
-    size_t       dataSize;
+
+#define myassert(e) { \
+    if(!(e)) { \
+        std::cerr << "myassert " << #e \
+                  << " " << __FILE__ << " " << __LINE__ << std::endl; \
+        abort(); \
+    } \
+}
+
+//
+// TODO: Design thought for factoring
+// MatrixShimAdapter to a part that controls the sequencing
+// and separate classes that have only
+// recvData or sendData and the extra data needed
+// to support them
+//
+// squentially generates the next index in a row-major
+// global array, for a SciDB-canonical-order set of blocks that
+// tile it.
+// In the general case, SciDB will use 4 size of block to tile
+// the matrix
+// A. full square bock, e.g. the first block when matrix is larger than block order
+// n. narrow block, on right most column when (F) won't fit
+// s. short block , on bottom row when (F) won't fit
+// z, narrow, short block, last block when no other will fit
+//
+// we can generalize the above by allowing the N,S,andNS blocks to equal
+// the size of (F) and using their names for the right-most, bottom-most,
+// and south-east most blocks
+// This way we can set the side of the four block types and just
+// advance the state, eg.
+//   AAAAAAAAn    n
+//   AAAAAAAAn    n 
+//   ssssssssz    z   ssssssz
+//
+// when a dimension is exactly a multiple of the chunk order,
+// the notation will be
+//   AA                 An
+//   AA    rather than  Az
+//
+// this should allow the A state to have more optimal transfer and
+// less involved code when iteration through indices belonging to
+// that state
+//
+// TODO Design the tool and factor RecvMatrix
+//
+
+class MatrixShimAdapter {
+public:
+    MatrixShimAdapter(size_t matRow,  size_t matCol,
+               size_t blkRows, size_t blkCols,
+               void*  matrix, size_t tSize)
+    :
+        _matrix(reinterpret_cast<char*>(matrix)),
+        _tSize(tSize),
+        _matRows(matRow),  _matCols(matCol),
+        _blkRows(blkRows), _blkCols(blkCols),
+        _matOffRow(0),     _matOffCol(0),       // where cur block is in matrix
+        _blkCurRow(0),     _blkCurCol(0),        // where we are in the block
+                                                // (and matrix) from Off[set]
+        _nBytesSoFar(0),
+        _extraBytes(0),
+        _recursing(false)
+    {
+        myassert(sizeof(_extraBuf) >= _tSize);
+        memset(_extraBuf, 0, sizeof(_extraBuf));
+    }
+
+    void recvData(const char* dataPtr, size_t dataLen) {
+        if(DBG) std::cerr << "recvData, dataLen " << dataLen << " nVals " << dataLen/_tSize << std::endl;
+        
+        // first have to deal with the fact that the amoutn supplied is not always
+        // a multiple of _tSize
+        // if there was any partial val left over from last time, try to complete it first
+        if(_extraBytes && !_recursing) {
+            std::cerr << "recvData, _extraBytes " << _extraBytes << std::endl;
+            size_t takeBytes = std::min(_tSize-_extraBytes, dataLen);
+            memcpy(_extraBuf+_extraBytes, dataPtr, takeBytes);
+            _extraBytes += takeBytes;
+            myassert(_extraBytes <= _tSize);
+            if(_extraBytes >= _tSize) {   // enough to process
+                _recursing=true; // skip _extraBytes handling on this call
+                recvData(_extraBuf, _extraBytes);
+                _recursing=false;
+                _extraBytes = 0;  // should be consumed now (CAREFUL?)
+            }
+            dataPtr += takeBytes;       // advance
+            dataLen -= takeBytes;
+            if (!dataLen) {
+                std::cerr << "recvData, _extraBytes left no more data, early return " << std::endl;
+                return;                 // done
+            }
+        }
+        if(_recursing) { myassert(_extraBytes==_tSize && dataLen == _tSize); }
+
+        // data comes in blocks.  each time we are called
+        // we may be starting mid-segment
+        // by running out of bytes at an arbitrary point we may end
+        // mid-segment
+        // when less than _tSize bytes remain, we store
+        // them in a tmp buffer and return, and next
+        // time will augment them until a single value
+        // can be consumed. (see above)
+
+        // transfers broken up by row in chunk, as addresses in
+        // _matrix are not continuous across these boundaries
+        while(dataLen >= _tSize && _nBytesSoFar < _matRows*_matCols*_tSize ) {
+            if(DBG) std::cerr << "recvData, @ " << _matOffRow+_blkCurRow
+                                         <<"," << _matOffCol+_blkCurCol << std::endl;
+            // NOTE, after first pass _blkCurCol == 0
+            size_t takeVals = blkColsTrimmed() - _blkCurCol; // Trimmed() changes with state
+            // but not more than we have data for
+            takeVals = std::min(takeVals, dataLen/_tSize);
+            size_t bytes = takeVals * _tSize;
+            myassert(bytes <= dataLen); //  must not take more than given
+
+            memcpy(dstAddr(), dataPtr, bytes);
+
+            _nBytesSoFar += bytes;        // advance dstAddr()
+            dataPtr += bytes;
+            dataLen -= bytes;
+            if(DBG) std::cerr << "recvData, takeVals " << takeVals
+                              << " leaving " << dataLen/_tSize << std::endl;
+
+            blockEndUpdates(takeVals);
+        }
+        if(DBG) std::cerr << "recvData, Bend, @ " << _matOffRow+_blkCurRow
+                                           <<"," << _matOffCol+_blkCurCol << std::endl;
+        myassert(_blkCurCol==0 || dataLen < _tSize); // on a fresh row, unless out of data
+
+        // the only leftovers should be less than _tSize
+        // handle it via the _extraBuf
+        if(dataLen) {
+            if(DBG) std::cerr << "recvData, dataLen " << dataLen
+                              << " being added to _extraBytes " << _extraBytes << std::endl;
+            myassert(dataLen < _tSize);
+            myassert(dataLen + _extraBytes < _tSize);   // it will all fit
+            memcpy(_extraBuf+_extraBytes, dataPtr, dataLen);
+            _extraBytes += dataLen;
+            dataLen = 0;
+            assert(_extraBytes < _tSize);
+        }
+        myassert(dataLen == 0);
+
+        // check -- did we copy dataLen?
+        if(DBG) std::cerr << "recvData END: _matOff: " << _matOffRow << ","
+                                                      << _matOffCol << std::endl; 
+        if(DBG) std::cerr << "recvData END: _blkCur: " << _blkCurRow << ","
+                                                      << _blkCurCol << std::endl; 
+    }
+
+    //
+    // SAME as above, but the memcopy direction is reversed.
+    // We control how much to return each time, so
+    // we don't have to deal with _extraBytes
+    //
+    size_t sendData(char* dataPtr, size_t dataLen) {
+        if(DBG) std::cerr << "sendData, dataLen " << dataLen << " nVals " << dataLen/_tSize << std::endl;
+
+        size_t bytesThisPass=0; // vs nBytesSoFar which is over multiple calls
+        
+        // data comes in blocks.  each time we are called
+        // 1. we may be starting mid-segment
+        // [We don't necesarily want to assume dataLen is ever greater than
+        //  the size of a segment]
+        // 2. by running out of bytes at an arbitrary point we may end
+        // mid-segment
+
+        // transfers broken up by row in chunk, as addresses in
+        // _matrix are not continuous across these boundaries
+
+        // for send: assert we have something left to send precondtion
+        // (vs for receive, that we took every bit of data they gave us)
+        myassert(_nBytesSoFar <= _matRows*_matCols*_tSize );
+        if(_nBytesSoFar == _matRows*_matCols*_tSize ) {
+            std::cerr << "-------------sendData, sent _nBytesSoFar: " << _nBytesSoFar << std::endl;
+            return 0;   // tell them we're done
+        }
+        
+        // send: while room to send && we have not sent everything we have
+        while(dataLen >= _tSize && _nBytesSoFar < _matRows*_matCols*_tSize ) {
+            if(DBG) std::cerr << "sendData, @ " << _matOffRow+_blkCurRow
+                                         <<"," << _matOffCol+_blkCurCol << std::endl;
+            // NOTE, after first pass _blkCurCol == 0
+            size_t takeVals = blkColsTrimmed() - _blkCurCol; // Trimmed() changes with state
+            // but not more than we have data for
+            takeVals = std::min(takeVals, dataLen/_tSize);
+            size_t bytes = takeVals * _tSize;
+            myassert(bytes <= dataLen); //  must not take more than room for
+
+            // send reversed
+            memcpy(dataPtr, dstAddr(), bytes);
+
+            bytesThisPass += bytes;
+            _nBytesSoFar += bytes;        // advance dstAddr()
+            dataPtr += bytes;
+            dataLen -= bytes;
+            // send modified
+            if(DBG) std::cerr << "sendData, takeVals " << takeVals
+                              << " leaving nVals" << _matRows*_matCols-_nBytesSoFar/_tSize << std::endl;
+            myassert(_nBytesSoFar <= _matRows*_matCols*_tSize); // send added
+
+            blockEndUpdates(takeVals);
+        }
+        if(DBG) std::cerr << "sendData, Bend, @ " << _matOffRow+_blkCurRow
+                                           <<"," << _matOffCol+_blkCurCol << std::endl;
+        myassert(_blkCurCol==0 || dataLen < _tSize); // on a fresh row, unless out of data
+
+        // check -- did we copy dataLen?
+        if(DBG) std::cerr << "sendData END: _matOff: " << _matOffRow << ","
+                                                      << _matOffCol << std::endl; 
+        if(DBG) std::cerr << "sendData END: _blkCur: " << _blkCurRow << ","
+                                                      << _blkCurCol << std::endl; 
+        return bytesThisPass;
+    }
+
+    bool isComplete() {
+          return (_nBytesSoFar == _matRows * _matCols * _tSize);
+    }
+
+    size_t bytesSoFar() { return _nBytesSoFar; }
+
+private:
+    enum dummy { DBG=0 };
+
+    size_t blkColsTrimmed() {
+        return std::min(_blkCols, _matCols-_matOffCol);
+    }
+    size_t blkRowsTrimmed() {
+        return std::min(_blkRows, _matRows-_matOffRow);
+    }
+
+    size_t toEndOfBlkRow() {
+        return blkColsTrimmed() - _blkCurCol;
+    }
+
+    size_t rowMajIdx() {
+        size_t row = _matOffRow + _blkCurRow; 
+        size_t col = _matOffCol + _blkCurCol; 
+        return _matCols * row + col;
+    }
+
+    char* dstAddr() {
+        return rowMajIdx() * _tSize + _matrix;
+    }
+
+    void assertConsistent() {
+        // whole values transmitted
+        myassert(_nBytesSoFar%_tSize == 0);
+        // compare bytes processed with matOff blkCur
+        size_t vals = 0;
+        vals += _matCols*_matOffRow;   // num vals in full rows of full blocks
+        vals += _blkRows*_matOffCol;  // full blocks to left of current offset
+
+        vals += blkColsTrimmed()*_blkRows; // full rows of current block
+        vals += _blkCols;                   // current partial block row
+
+        if (vals != _nBytesSoFar/_tSize) {
+            if(DBG) std::cerr << " myassert vals " << vals << " byte so far " << _nBytesSoFar << std::endl;
+        }
+        myassert(vals == _nBytesSoFar*_tSize);
+    }
+
+    void blockEndUpdates(size_t nVals) {
+        _blkCurCol += nVals;
+        if(DBG) std::cerr << "blockEndUpdates("<<nVals<<"), _blkCurCol now" << _blkCurCol << std::endl;
+
+        myassert(_blkCurRow <= blkRowsTrimmed());
+        myassert(_blkCurCol <= blkColsTrimmed());  // how?  _blkCurcol =1000, _matCols=15002, _matOffcol=1500
+
+        if(_blkCurCol == blkColsTrimmed()) {    // goto next row in block
+            _blkCurCol = 0;
+            _blkCurRow++;
+            if(DBG) std::cerr << "blockEndUpdates: fresh row _matOff: " << _matOffRow << ","
+                                                                        << _matOffCol << std::endl; 
+            if(DBG) std::cerr << "blockEndUpdates: fresh row _blkCurr" << _blkCurRow << ","
+                                                                       << _blkCurCol << std::endl; 
+        }
+        myassert(_blkCurCol <= _blkCols);
+
+        if(_blkCurRow >= blkRowsTrimmed()) { // next block
+            _blkCurRow=0; // starting point of next block
+            if(DBG) std::cerr << "blockEndUpdates: next block" << std::endl; 
+
+            // change _matOff
+            size_t newCol = _matOffCol + _blkCols;
+            if ( newCol < _matCols ) { // next block is to the right
+                _matOffCol = newCol;   // as of this happening
+                // no change to _matOffRow 
+            } else { // next block is first in next row
+                _matOffCol = 0;
+                _matOffRow += _blkRows;
+            }
+            if(DBG) std::cerr << "blockEndUpdates: offset " << _matOffCol << ","
+                                                            << _matOffRow << std::endl; 
+        }
+    }
+
+    char * const _matrix;                       // TODO: make class not-copyable
+    const size_t _tSize;
+    const size_t _matRows, _matCols;
+    const size_t _blkRows, _blkCols;
+
+    size_t       _matOffRow, _matOffCol;
+    size_t       _blkCurRow, _blkCurCol;
+    size_t       _nBytesSoFar;
+
+    char         _extraBuf[sizeof(double)];
+    size_t       _extraBytes;
+    bool         _recursing;
 };
 
-size_t receiveData(char *bufptr, size_t size, size_t nitems, void * userp)
+size_t CBRecvData(char *bufptr, size_t size, size_t nitems, void * userp)
 {
     bool cerrDebug=false;
     if(cerrDebug) {
-        std::cerr << "[cerrDebug] receiveData: size: " << size << std::endl;
-        std::cerr << "[cerrDebug] receiveData: nitems: " << nitems << std::endl;
-        std::cerr << "[cerrDebug] receiveData: returning: " << size*nitems << std::endl;
+        std::cerr << "[cerrDebug] CBRecvData: size: " << size << std::endl;
+        std::cerr << "[cerrDebug] CBRecvData: nitems: " << nitems << std::endl;
+        std::cerr << "[cerrDebug] CBRecvData: returning: " << size*nitems << std::endl;
     }
 
 
     size_t inBytes = size * nitems;
     // cast (yuck) the callback (yuck) data to its presumed type
-    RecvStuff * output(reinterpret_cast<RecvStuff*>(userp));
-    //TODO remove std::string ** const retStr(reinterpret_cast<std::string**const>(userp));
+    MatrixShimAdapter* output(reinterpret_cast<MatrixShimAdapter*>(userp));
 
     // so now what we'll do is return a string to userp [aka retStr], unless it is NULL
     if (!output) {
-        std::cerr << "receiveData: warning, caller discarded the full " << size*nitems << " bytes." << std::endl;
+        std::cerr << "CBRecvData: warning, caller discarded the full " << size*nitems << " bytes." << std::endl;
     } else {
-        // transfer no more than allowed (receiveData maybe called repeatedly)
-        size_t copyBytes = std::min(inBytes, output->bufSize - output->dataSize); // note may be part filled already
-        memcpy(output->recvData + output->dataSize, bufptr, copyBytes);
-        output->dataSize += copyBytes;
-
-        size_t remainder = inBytes - copyBytes;
-        if (remainder > 0) {
-            // some was left over and not copied
-            std::cerr << "receiveData: overflow of " << size*nitems << " bytes." << std::endl;
-            // TODO: should this raise an exception?
-        }
+        output->recvData(bufptr, inBytes);
     }
 
+    // question: can we take only as many as we want?
     return inBytes; // TODO: figure out if this shold be copyBytes vs inBytes
 }
 
-
-
-//
-// a callback for sending data via curl
-//
-struct SendStuff {
-    const char * sendSrc;
-    size_t sizeLeft;
-};
-
-size_t sendData(char *bufptr, size_t size, size_t nitems, void * userp)
+size_t CBSendData(char *bufptr, size_t size, size_t nitems, void * userp)
 {
-    //std::string * const dataStr(reinterpret_cast<std::string*const>(userp));
-    struct SendStuff* sendStuff = reinterpret_cast<SendStuff*>(userp);
+    MatrixShimAdapter* cbMatrix = reinterpret_cast<MatrixShimAdapter*>(userp);
+    size_t bytesSent = cbMatrix->sendData(bufptr, size*nitems);
 
-    size_t  minSize = std::min(sendStuff->sizeLeft, size*nitems);
-    if(minSize < 1) return 0;
-
-    memcpy(bufptr, sendStuff->sendSrc, minSize);
     bool cerrDebug=false;
     if(cerrDebug) {
-        std::cerr << "[cerrDebug] sendData: size " << size << std::endl;
-        std::cerr << "[cerrDebug] sendData: nitems " << nitems << std::endl;
-        std::cerr << "[cerrDebug] sendData: sent " << minSize << " bytes." << std::endl;
-        std::cerr << "[cerrDebug] sendData: from " << (void*)(sendStuff->sendSrc) << " bytes." << std::endl;
+        std::cerr << "[cerrDebug] CBSendData: size " << size << std::endl;
+        std::cerr << "[cerrDebug] CBSendData: nitems " << nitems << std::endl;
+        std::cerr << "[cerrDebug] CBSendData: bytesSent " << bytesSent << std::endl;
     }
-    sendStuff->sendSrc += minSize;
-    sendStuff->sizeLeft -= minSize;
-
-
-    return minSize;
+    return bytesSent;
 }
 
 //
 // run a simple query via curl (no array uploads or downloads)
 //
-std::string doHTMLGetString(CURL* easyHandle, const std::string& URL, bool resultExpected=true)
+std::string curlGetString(CURL* easyHandle, const std::string& url, bool resultExpected=true)
 {
     bool cerrDebug=false;
     if(cerrDebug) {
-        std::cerr << "[cerrDebug] doHTMLGetString, URL is: " << URL << std::endl; 
+        std::cerr << "[cerrDebug] curlGetString, url is: " << url << std::endl; 
     }
 
     // TODO: make this a modifiable, empty string
@@ -226,18 +527,18 @@ std::string doHTMLGetString(CURL* easyHandle, const std::string& URL, bool resul
     }
     curl_easy_setopt(easyHandle, CURLOPT_HTTPGET, 1L);
 
-    curl_easy_setopt(easyHandle, CURLOPT_URL, URL.c_str());
+    curl_easy_setopt(easyHandle, CURLOPT_URL, url.c_str());
     CURLcode code = curl_easy_perform(easyHandle);
     if(code != CURLE_OK) {
-        throw std::runtime_error("ERROR doHTMLGetString: perform failed");
+        throw std::runtime_error("ERROR curlGetString: perform failed");
     }
     if(resultExpected) {
         if(receivedStr.size() == 0) {
-            throw std::runtime_error("ERROR doHTMLGetString: no data received");
+            throw std::runtime_error("ERROR curlGetString: no data received");
         }
     } else {
         if(receivedStr.size() != 0) {
-            throw std::runtime_error("ERROR doHTMLGetString: received unexpected data");
+            throw std::runtime_error("ERROR curlGetString: received unexpected data");
         }
     }
 
@@ -245,55 +546,56 @@ std::string doHTMLGetString(CURL* easyHandle, const std::string& URL, bool resul
     // TODO: possbile that whitespace trimming should be option-controlled
 
     if (cerrDebug && resultExpected) {
-        std::cerr << "[cerrDebug] doHTMLGetString, received string is: " << receivedStr << std::endl; 
+        std::cerr << "[cerrDebug] curlGetString, received string is: " << receivedStr << std::endl; 
     }
     return receivedStr;
 }
+
+const size_t BlkRows=1000, BlkCols=1000;
 
 //
 // Data version of the above, for getting binary data back
 //  (caller interprets the bytes)
 //
-size_t doHTMLGetData(CURL* easyHandle, const std::string& URL, char * data, size_t dataMax)
+template <typename scalar_tt>
+void curlGetMatrix(CURL* easyHandle, const std::string& url, scalar_tt* data, size_t nRow, size_t nCol)
 {
+    size_t tSize = sizeof(scalar_tt);
+
     bool cerrDebug=false;
     if(cerrDebug) {
-        std::cerr << "[cerrDebug] doHTMLGetData, URL is: " << URL << std::endl; 
-        std::cerr << "[cerrDebug] doHTMLGetData, dataMax is: " << dataMax << std::endl; 
+        std::cerr << "[cerrDebug] curlGetMatrix, URL is: " << url << std::endl; 
+        std::cerr << "[cerrDebug] curlGetMatrix, nRow: " << nRow << std::endl; 
+        std::cerr << "[cerrDebug] curlGetMatrix, nCol: " << nCol << std::endl; 
+        std::cerr << "[cerrDebug] curlGetMatrix, tSize: " << tSize << std::endl; 
     }
 
-    RecvStuff recvStuff;
-    recvStuff.recvData = data;
-    recvStuff.bufSize = dataMax;
-    recvStuff.dataSize = 0;
+    MatrixShimAdapter recvMatrix(nRow,  nCol, BlkRows, BlkCols, (void*)data, tSize);
 
     // TODO: how to handle the case where more is received that the length of data?
     //       throwing an exception might be a problem
 
     // receive anything it sends
-    curl_easy_setopt(easyHandle, CURLOPT_WRITEFUNCTION, receiveData);
-    curl_easy_setopt(easyHandle, CURLOPT_WRITEDATA, &recvStuff);
+    curl_easy_setopt(easyHandle, CURLOPT_WRITEFUNCTION, CBRecvData);
+    curl_easy_setopt(easyHandle, CURLOPT_WRITEDATA, &recvMatrix);
     curl_easy_setopt(easyHandle, CURLOPT_HTTPGET, 1L);
+    curl_easy_setopt(easyHandle, CURLOPT_URL, url.c_str());
 
-    curl_easy_setopt(easyHandle, CURLOPT_URL, URL.c_str());
     CURLcode code = curl_easy_perform(easyHandle);
     if(code != CURLE_OK) {
-        if(cerrDebug) {
-            std::cerr << "[cerrDebug] doHTMLGetData, perform failed" << std::endl; 
-        }
-        throw std::runtime_error("ERROR doHTMLGetData: perform failed");
+        std::cerr << "[cerrDebug] curlGetMatrix, perform fail code" << code << std::endl; 
+        throw std::runtime_error("ERROR curlGetMatrix: perform failed");
     }
-    if(!recvStuff.dataSize) {
-        throw std::runtime_error("ERROR doHTMLGetData: received no data");
+
+    if(!recvMatrix.isComplete()) {
+        std::cerr << "error: recvMatrix not complete nRow " << nRow
+                  << " nCol " << nCol << " tSize " << tSize
+                  << " bytesSoFar " << recvMatrix.bytesSoFar() << std::endl;
+        throw std::runtime_error("ERROR curlGetMatrix: recvMatrix incomplete");
     }
 
     // TODO: possible that whitespace trimming should be done here,
     // TODO: possbile that whitespace trimming should be option-controlled
-
-    if(cerrDebug) {
-        std::cerr << "[cerrDebug] doHTMLGetData, recvStuff.dataSize is: " << recvStuff.dataSize << std::endl; 
-    }
-    return recvStuff.dataSize;
 }
 
 //
@@ -305,53 +607,92 @@ size_t doHTMLGetData(CURL* easyHandle, const std::string& URL, char * data, size
 // run a SciDB query via a particular shim session
 //
 // TODO: becomes a method of Shim
+// TODO: return void
 //
-std::string executeQuery(Shim& shim, const std::string& query, const std::string& scalarName=std::string())
+std::string executeQuery(Shim& shim,
+                         const std::string& nickName,
+                         const std::string& query,
+                         const std::string& binaryFormat=std::string())
 {
+    // need a new session for a new query
+    // except between an upload(not a query) and
+    // the query that uses it
+    // so maybe we only need new sessions just before uploads
+    
     // paste together the base URL stuff with the URL-escaped query
-    std::string URL = shim.baseURL + "/execute_query?id=" + shim.session
+    std::string url = shim.baseURL + "/execute_query?id=" + shim.session
                                    + "&query=" + curl_easy_escape(shim.curlHandle, query.c_str(), 0);
-    if (scalarName.size()) {
-        URL += "&save=" ;
-        URL += "(" ;
-        URL += scalarName;
-        URL += ")" ;
+    if (binaryFormat.size()) {
+        url += "&save=" ;
+        url += "(" ;
+        url += binaryFormat;    // e.g. "float" "double"
+        url += ")" ;
     }
 
-    // TODO: add a catch here and extend the exception with a from:
-    std::string qid = doHTMLGetString(shim.curlHandle, URL);
+    double start=getsecs();
+    std::string qid = curlGetString(shim.curlHandle, url);
+    double secs = getsecs() - start;
+    if(shim.verbose) {
+        shim.tsos << "[v]                     executeQuery: " << nickName << ": QID: " << qid << std::endl;
+    }
+    if(secs > shim.timing) {
+        shim.tsos << "[t] " << secs << " .... executeQuery: " << nickName << std::endl;
+    }
     return qid;
 }
+
 //
+// newSession, needed after[before?] file uploads, maybe other places
 //
-// run a SciDB query via a particular shim session
+void new_session(Shim& shim)
+{
+    if(shim.verbose) {
+        shim.tsos << "new_session: releasing " << shim.session << std::endl;
+    }
+    std::string URL = shim.baseURL + "/release_session?id=" + shim.session ;
+    curlGetString(shim.curlHandle, URL, false); // nothing returned on a release
+    shim.session  = curlGetString(shim.curlHandle, shim.baseURL + "/new_session");
+    if(shim.verbose) {
+        shim.tsos << "new_session: acquired " << shim.session << std::endl;
+    }
+}
+
 //
 // TODO: becomes a method of Shim
 //
 template<typename scalar_tt>
-void readBytesMatrix(Shim& shim, scalar_tt* array, size_t nRow, size_t nCol)
+void readResultMatrix(Shim& shim, std::string nickName,
+                      scalar_tt* array, size_t nRow, size_t nCol)
 {
     // paste together the query and the base URL stuff
     std::stringstream ssURL;
     ssURL << shim.baseURL << "/read_bytes?id=" << shim.session << "&n=" << nRow*nCol*sizeof(scalar_tt);
 
-    size_t bytesToRead = nRow*nCol*sizeof(scalar_tt);
-    size_t bytesRead = doHTMLGetData(shim.curlHandle, ssURL.str(), reinterpret_cast<char*>(array), bytesToRead);
-
-    // TODO: add a catch here?  what if too long? too short? 
-    if(bytesRead != bytesToRead) {
-        abort();
+    double start=getsecs();
+    curlGetMatrix(shim.curlHandle, ssURL.str(), array, nRow, nCol);
+    double secs = getsecs() - start;
+    if(shim.verbose) {
+        shim.tsos << "[v]                     readResultMatrix: " << nickName << std::endl;
     }
+    if(secs > shim.timing) {
+        shim.tsos << "[t] " << secs << " .... readResultMatrix: " << nickName << std::endl;
+    }
+
+    new_session(shim); // after invoking a curl read, we need a new session
+    // preventative for a hanging read of a query
+    // when beta is non-zero (a C matrix sent)
+    // or maybe this should be before the scan query?
 }
+
 
 
 //
 // scan_matrix
 //
 void scan_matrix(Shim& shim, const std::string& nameA,
-                 const std::string& scalarName, size_t nRow, size_t nCol)
+                 const std::string& scalarName, size_t reshapeRows, size_t reshapeCols)
 {
-    // scalarname is "float" or "double"
+    // scalarName is "float" or "double"
     if (scalarName != std::string("float") &&
         scalarName != std::string("double")) {
         throw std::runtime_error("gemm: scalarName 'float' or 'double' required");
@@ -362,42 +703,33 @@ void scan_matrix(Shim& shim, const std::string& nameA,
     //
     std::stringstream query;
 
-    // reshape to a a vector, this will serialize the data in row-major order
-    query << "reshape(";
-    
-    // the query itself is a scan if double
-    // or if float, have to project(apply()) to get it to double
-    if(scalarName == std::string("double")) {
-        query << "scan(" << nameA << ")";
-    } else {
-        query << "project(apply(" << nameA << ",vDbl,double(v)), vDbl)" ;
+    if(DoReshape) {
+        // reshape to a a vector, this will serialize the data in row-major order
+        // and the client will not have to relocate chunks by position
+        query << "reshape(";
     }
     
-    // and close the reshape expression
-    query << ", <v:double>[i=0:"<<nRow*nCol<<"-1,1000,0])";
+    const bool scidbGemmDoubleOnly = getenv("SCIDB_GEMM_DOUBLE_ONLY");
+    if(scidbGemmDoubleOnly && scalarName == std::string("float")) {
+        // expecting flaot, but we have only double
+        query << "project(apply(" << nameA << ",vDbl,double(v)), vDbl)" ;
+    } else {
+        query << "scan(" << nameA << ")";
+    }
+    
+    if(DoReshape) {
+        // close the reshape expression
+        query << ", <v:" << scalarName << ">[i=0:"<<reshapeRows*reshapeCols<<"-1,1000,0])";
+    }
                                                   
     if(shim.verbose) {
-        std::cerr << "[verbose] scan_matrix query is '" << query.str() << "'" << std::endl; 
-        std::cerr << "[verbose] scan_matrix scalarName is: " << scalarName << std::endl; 
+        std::cerr << "[v]               scan_matrix query is '" << query.str() << "'" << std::endl; 
+        std::cerr << "[v]               scan_matrix scalarName is: " << scalarName << std::endl; 
     }
-    std::string qid = executeQuery(shim, query.str(), scalarName);
+    std::string qid = executeQuery(shim, "scan matrix", query.str(), scalarName);
+    // no new_session() here ever ... the query result is not read yet!
 }
 
-//
-// newSession
-//
-void new_session(Shim& shim)
-{
-    if(shim.verbose) {
-        shim.tsos << "new_session: releasing " << shim.session << std::endl;
-    }
-    std::string URL = shim.baseURL + "/release_session?id=" + shim.session ;
-    doHTMLGetString(shim.curlHandle, URL, false); // nothing returned on a release
-    shim.session  = doHTMLGetString(shim.curlHandle, shim.baseURL + "/new_session");
-    if(shim.verbose) {
-        shim.tsos << "new_session: acquired " << shim.session << std::endl;
-    }
-}
 
 //
 // API: create_temp_matrix
@@ -408,14 +740,9 @@ std::string create_temp_matrix(Shim& shim, size_t nrow, size_t ncol, const std::
     sprintf(createQuery, "create TEMP array %s <v:%s>[r=0:%ld-1,1000,0,c=0:%ld-1,1000,0]",
                           resultName.c_str(), scalarTypeName.c_str(), nrow, ncol);
     if(shim.verbose) {
-        shim.tsos << "[verbose] create_temp_matrix: createQuery is '" << createQuery << "'" << std::endl; 
+        shim.tsos << "[v]                 create_temp_matrix: createQuery is '" << createQuery << "'" << std::endl; 
     }
-    std::string qid = executeQuery(shim, createQuery);
-    if(shim.verbose) {
-        shim.tsos << "[verbose] create_temp_matrix: input QID: " << qid << std::endl;
-    }
-    new_session(shim); // can only be tested when Beta is 0
-
+    std::string qid = executeQuery(shim, "create_temp_array", createQuery);
     return resultName;
 }
 
@@ -432,257 +759,198 @@ template<> const char* typeStr<double>(double val) { return "double";}
 // API: send_matrix
 //
 // TODO: add matrix source data pointer
-// NOTE: shim gets a new session as a side-effect
+// NOTE: shim may get a new session as a side-effect
+// result is an expression or name of array containing the result,
+// depending on the setting of shim.lazyEval
 //
 template<typename scalar_tt>
 std::string send_matrix(Shim& shim, const scalar_tt* data, size_t nrow, size_t ncol, const std::string& resultName)
 {
-    if(shim.verbose) {
-        shim.tsos << "[verbose] send_matrix: entered" << std::endl; 
-    }
+    std::string result;
+
+    // parameters
+
+    if(shim.verbose) { shim.tsos << "[v]              send_matrix: entered" << std::endl; }
+
     const char* scalarName=typeStr(data[0]);
+    size_t      dataBytes = nrow*ncol*sizeof(scalar_tt);
+
+    // hack, until MatrixShimAdapater split into sender and receiver
+    scalar_tt* s_data = const_cast<scalar_tt*>(data);
+    char*      c_data = reinterpret_cast<char*>(s_data);
+    MatrixShimAdapter cbMatrix(nrow,  ncol, BlkRows, BlkCols, c_data, sizeof(scalar_tt));
+
+    if(shim.verbose) { shim.tsos << "[v]               send_matrix: nrow " << nrow << " ncol " << ncol << std::endl; }
+
+    bool doDebugSeq=false;
+    if(doDebugSeq) {
+        // debug pre-numbering: overwrite data with something easy to track
+        float* fltData= reinterpret_cast<float*>(c_data);
+        for(size_t i=0; i<dataBytes/sizeof(float); i++) {
+            fltData[i] = float(i);
+        }
+    }
 
     //
-    // upload matrix data
+    // PART A: create the temp file
+    // can't avoid the temp array until the shim session can be
+    // preserved across file uploads to run the final gemm
     //
-    const size_t dataBytes=nrow*ncol*sizeof(scalar_tt);
-
-    // may not be needed when CURLFORM_BUFFER,BUFFERPTR used
-    SendStuff sendStuff;
-    sendStuff.sendSrc = reinterpret_cast<const char*>(data);
-    sendStuff.sizeLeft = dataBytes;
-
-    if(shim.verbose) {
-        shim.tsos << "[verbose] send_matrix: nrow " << nrow << " ncol " << ncol << std::endl; 
-        shim.tsos << "[verbose] send_matrix: uploading '" << sendStuff.sizeLeft << "bytes" << std::endl; 
-        shim.tsos << "[verbose] send_matrix: sendSrc " << (void*)sendStuff.sendSrc << std::endl; 
-    }
-    
-    //
-    // creates to make the TEMP arrays
-    //
-    char createLoadQuery[1000];
-    sprintf(createLoadQuery, "create TEMP array TMPLOAD123 <v:%s>[i=0:%ld-1,1000,0]", scalarName, nrow * ncol);
-    if(shim.verbose) {
-        shim.tsos << "[verbose] send_matrix: createLoadQuery is '" << createLoadQuery << "'" << std::endl; 
-    }
-    std::string qid = executeQuery(shim, createLoadQuery);
-    if(shim.verbose) { shim.tsos << "[verbose] send_matrix: input QID: " << qid << std::endl; }
-    // new_session(shim);
-
-    char createReshapeQuery[1000];
-    sprintf(createReshapeQuery, "create TEMP array %s <v:%s>[r=0:%ld-1,1000,0,c=0:%ld-1,1000,0]",
-                                resultName.c_str(), scalarName, nrow, ncol);
-    if(shim.verbose) {
-        shim.tsos << "[verbose] send_matrix: createReshapeQuery is '" << createReshapeQuery << "'" << std::endl; 
-    }
-    qid = executeQuery(shim, createReshapeQuery);
-    if(shim.verbose) {
-        shim.tsos << "[verbose] send_matrix: input QID: " << qid << std::endl;
-    }
-    // new_session(shim);
+    create_temp_matrix(shim, nrow, ncol, resultName, scalarName);
 
     //
-    // can factor this to doHTMLPost -- similar to doHTMLGetData?
+    // PART B: upload the file
     //
-    if(shim.verbose) {
-        shim.tsos << "[verbose] send_matrix: ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~POST~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~" << std::endl;
-    }
-    std::string filenameStr;
-    const size_t MAX_ATTEMPTS=16;
-    for(size_t attempts=1; attempts < MAX_ATTEMPTS; attempts++) {
-    
-        // URL
+    new_session(shim); // before an upload we NEED a fresh session
+    if(shim.verbose) { shim.tsos << "[v]              send_matrix: ~~~~~~~POST~~~~~~~~" << std::endl; }
+    const size_t MAX_UPLOAD_ATTEMPTS=3; // sometimes upload times out or gets error
+
+    double uploadSecs=0;
+
+    std::string filePath;
+    for(size_t attempts=1; attempts < MAX_UPLOAD_ATTEMPTS; attempts++) {
+        // TODO: get URL from shim
         char uploadURL[1000];
-        sprintf(uploadURL, "http://localhost:8080/upload_file?id=%s", shim.session.c_str());
+        sprintf(uploadURL, "%s/upload_file?id=%s", shim.baseURL.c_str(), shim.session.c_str());
         if(shim.verbose) {
-            shim.tsos << "[verbose] send_matrix: uploadURL is '" << uploadURL << "'" << std::endl; 
+            shim.tsos << "[v]                         send_matrix: uploadURL is '" << uploadURL << "'" << std::endl; 
+            shim.tsos << "[v]                         send_matrix: form _CONTENTS_LENGTH=" << dataBytes << "'" << std::endl;
         }
 
+        // curl POST, not this way because need multipart, custom headers for binary file
+        // curl_easy_setopt(shim.curlHandle, CURLOPT_POST, 1L);
+        // curl_easy_setopt(shim.curlHandle, CURLOPT_POSTFIELDS, NULL);
+        // curl_easy_setopt(shim.curlHandle, CURLOPT_POSTFIELDSIZE_LARGE, dataBytes);
+        // curl_easy_setopt(shim.curlHandle, CURLOPT_READFUNCTION, CBSendData); // callback
+        // curl_easy_setopt(shim.curlHandle, CURLOPT_READDATA, &cbMatrix); // or @CFM_STREAM?
+        // headers=curl_slist_append(headers, "Content-Disposition: form-data; name=\"fileupload\"; filename=\"data\"");
 
-        // curl POST, multipart, custom headers for binary file upload
-        //curl_easy_setopt(shim.curlHandle, CURLOPT_POST, 1L); // want to POST here, then receive the filename back
-        //curl_easy_setopt(shim.curlHandle, CURLOPT_POSTFIELDS, NULL); // want to POST here, then GET the filename back
-        //curl_easy_setopt(shim.curlHandle, CURLOPT_POSTFIELDSIZE_LARGE, dataBytes); // want to POST here, then GET the filename back
-        //curl_easy_setopt(shim.curlHandle, CURLOPT_READFUNCTION, sendData); // send this data
-        //curl_easy_setopt(shim.curlHandle, CURLOPT_READDATA, &sendStuff);
-        //headers=curl_slist_append(headers, "Content-Disposition: form-data; name=\"fileupload\"; filename=\"data\"");
-
+        // disable the "Expect: 100-continue", it causes 1-sec timeout delays with shim's mongoose web server
         struct curl_slist* headers=NULL;
         headers= curl_slist_append(headers, "Expect:");
         curl_easy_setopt(shim.curlHandle, CURLOPT_HTTPHEADER, headers);
 
-        struct curl_slist* formHeaders=NULL;
-        formHeaders= curl_slist_append(formHeaders, "Content-Type: application/octet-stream");
+        // manually add binary data header
+        // struct curl_slist* formHeaders=NULL;
+        // formHeaders= curl_slist_append(formHeaders, "Content-Type: application/octet-stream");
+
+#define CURLFORM_STREAM_WORKAROUND 1
+#if CURLFORM_STREAM_WORKAROUND
+        // note: the CURLFORM_STREAM stuff does not succeed in getting file data
+        // to shim, but the BUFFPERPTR, BUFFERLENGTH does
+        // so as a work-around, we ourselves call the cbMatrix to re-order
+        // the ENTIRE matrix into a tmp buffer, and then send that with BUFFERPTR.
+        shim.tsos << "warning: matrix upload workaround active" << std::endl;
+        std::vector<char> chunkedData(dataBytes,0);
+        cbMatrix.sendData(&chunkedData[0], dataBytes);
+#endif
+
         struct curl_httppost* post=NULL;
         struct curl_httppost* last=NULL;
         CURLFORMcode formcode = curl_formadd(&post, &last,
                                              CURLFORM_COPYNAME,"fileupload",
-                                             CURLFORM_BUFFER,  "data",
-                                             CURLFORM_BUFFERPTR, data,
+                                             CURLFORM_BUFFER,  "data",  // if 1 buffer
+#if CURLFORM_STREAM_WORKAROUND
+                                             CURLFORM_BUFFERPTR, &chunkedData[0],
                                              CURLFORM_BUFFERLENGTH, dataBytes,
-                                             CURLFORM_CONTENTHEADER, formHeaders,
+#else
+                                             CURLFORM_STREAM, &cbMatrix, // CBSendData 4th arg
+                                             // also set CURLOPT_READFUNCTIION
+                                             CURLFORM_CONTENTSLENGTH, dataBytes
+#endif
+                                             CURLFORM_CONTENTTYPE, "binary",    // poorly documented!
+                                             //CURLFORM_CONTENTHEADER, formHeaders,
                                              CURLFORM_END);
         if(formcode != CURL_FORMADD_OK) {
             shim.tsos << "ERROR send_matrix: curl_formadd failed with code: " << formcode << std::endl;
             throw std::runtime_error("send_matrix: curl_formadd failed");
         }
-        curl_easy_setopt(shim.curlHandle, CURLOPT_HTTPPOST, post); // want to POST here, then GET the filename back
 
-        // curl receive pathname of the tmp file back
-        curl_easy_setopt(shim.curlHandle, CURLOPT_WRITEFUNCTION, receiveString);
-        curl_easy_setopt(shim.curlHandle, CURLOPT_WRITEDATA, &filenameStr);
+        curl_easy_setopt(shim.curlHandle, CURLOPT_HTTPPOST, post); // want to POST here, then GET the filename back
+        curl_easy_setopt(shim.curlHandle, CURLOPT_WRITEDATA, &filePath);          // to get filePath back
+        curl_easy_setopt(shim.curlHandle, CURLOPT_WRITEFUNCTION, receiveString);  // ditto
+        curl_easy_setopt(shim.curlHandle, CURLOPT_URL, uploadURL);
 
         // run the page
-        curl_easy_setopt(shim.curlHandle, CURLOPT_URL, uploadURL);
+        double start = getsecs();
         CURLcode code = curl_easy_perform(shim.curlHandle);
-        if(shim.verbose) {
-            shim.tsos << "[verbose] send_matrix: curl_easy_perform done '" << filenameStr << "'" << std::endl;       // ### need this for the following 'load' query
-        }
-        curl_formfree(post);
-        curl_easy_setopt(shim.curlHandle, CURLOPT_HTTPHEADER, NULL);    // cancel the header change, it messes up the load query
-        curl_slist_free_all(headers);
-        curl_slist_free_all(formHeaders);
+        uploadSecs+= getsecs()-start;
+        if(shim.verbose) { shim.tsos << "[v]                    send_matrix: shim filepath '" << filePath << "'" << std::endl; }
 
+        //
+        // cleanups in reverse order of their use, to make it easier to track
+        //
+        curl_easy_setopt(shim.curlHandle, CURLOPT_WRITEFUNCTION, NULL);
+        curl_easy_setopt(shim.curlHandle, CURLOPT_WRITEDATA, NULL);
+        curl_easy_setopt(shim.curlHandle, CURLOPT_HTTPPOST, NULL);
+        curl_formfree(post);
+        curl_easy_setopt(shim.curlHandle, CURLOPT_HTTPHEADER, NULL);    // not clearing this makes severe trouble later
+        curl_slist_free_all(headers);
+        curl_easy_setopt(shim.curlHandle, CURLOPT_READFUNCTION, NULL);
+
+
+        // success yet?
         if(code != CURLE_OK) {
-            if (attempts < MAX_ATTEMPTS) {
-                // getting these every once in a while, there could be a problem
-                // with the service time of shim's web server, so backing off and trying
-                // again could be helpful.
-                assert(MAX_ATTEMPTS < sizeof(size_t)*8);  // TODO: BITS_PER_BYTE constant?
-                size_t retrySecs = 1 << (attempts-1);
-                shim.tsos << "send_matrix: upload_file failed, retrying in " << retrySecs << "secs" << std::endl;
-                sleep(retrySecs);
-                continue;
-                // if this is happening, try listing the existing arrays and the expected
-                // server-side file path on the server, to see if this code would need
-                // to do more to recover than just repeat the upload
-            } else {
+            // getting these with shim server every once in a while
+            if (attempts == MAX_UPLOAD_ATTEMPTS) {
                 throw std::runtime_error("send_matrix: upload_file failed");
             }
+            size_t retrySecs = 1 << (attempts-1);  // exponential back-off
+            shim.tsos << "send_matrix: upload_file failed, retrying in " << retrySecs << "secs" << std::endl;
+            sleep(retrySecs);
+            continue;
         }
-        if(filenameStr.size() == 0) {
-            // this tends to happen after the first failure above happens once
-            // after that stuck in some mode where this is what happens
+
+        if(filePath.size() == 0) {      // happens with session problems or other failures
             throw std::runtime_error("send_matrix: upload_file no remote filename returned");
         }
 
-        if(shim.verbose) {
-            shim.tsos << "[verbose] send_matrix: filename: '" << filenameStr << "'" << std::endl;       // ### need this for the following 'load' query
+        if(shim.verbose) { shim.tsos << "[v]            send_matrix: upload " << filePath << " success" << std::endl; }
+
+        if(uploadSecs > shim.timing) {
+            shim.tsos << "[t] " << uploadSecs << " .... send_matrix: upload " << filePath << std::endl;
         }
-        break; // success
+        break; // don't retry
     }
 
-
     //
-    // load the data file into tmp ARRAY
-    // TODO: don't use a hard-coded name like TMPLOAD123
-    // TODO: test for a collision with an existing array
-    //       rather than risk it being overwritten or incompatible
+    // PART C: load the array
     //
-    
-
-    // "load" the datafile
+    // TODO: test for a collision with an existing array name?
+    //       right now it is the callers responsibility
+ 
     char loadQuery[1000];
-    sprintf(loadQuery, "store(input(<v:%s>[i=0:%ld-1,1000,0],'%s',-2,'(%s)'),TMPLOAD123)",
-                        scalarName, nrow * ncol, filenameStr.c_str(), scalarName);
-    if(shim.verbose) {
-        shim.tsos << "[verbose] send_matrix: loadQuery is '" << loadQuery << "'" << std::endl; 
-    }
-    qid = executeQuery(shim, loadQuery);
-    if(shim.verbose) {
-        shim.tsos << "[verbose] send_matrix: input QID: " << qid << std::endl;
-    }
+    sprintf(loadQuery,
+            "store(input(<v:%s>[i=0:%ld-1,1000,0,c=0:%ld-1,1000,0],'%s',-2,'(%s)'),%s)",
+            scalarName, nrow, ncol, filePath.c_str(), scalarName,
+            resultName.c_str());
+    if(shim.verbose) { shim.tsos << "[v]               send_matrix: loadQuery is '" << loadQuery << "'" << std::endl; }
 
-    //
-    // TODO: drop session to drop uploaded file, or find way to do it explicitly
-    //
-    new_session(shim);
-
-    const int CHECK_DATA_SIZE=1000*1000;
-    if(shim.check && (nrow * ncol <= CHECK_DATA_SIZE)) {
-        if(shim.verbose) {
-            shim.tsos << "[verbose] send_matrix: CHECK A : issuing scan of the uploaded matrix" << std::endl;
-        }
-        scan_matrix(shim, "TMPLOAD123", scalarName, nrow, ncol);
-
-        scalar_tt checkData[CHECK_DATA_SIZE];
-        memset(checkData, 0, nrow*ncol*sizeof(scalar_tt));      // optional
-        readBytesMatrix(shim, checkData, nrow, ncol); 
-        if(shim.verbose) {
-            shim.tsos << "[verbose] send_matrix: check A : results received" << std::endl;
-        }
-        if(memcmp(data, checkData, nrow*ncol*sizeof(scalar_tt))) {
-            shim.tsos << "ERROR send_matrix: check A : results differ" << std::endl;
-            for(size_t i =0; i < nrow*ncol; i++) {
-                if (data[i] != checkData[i]) {
-                    shim.tsos << "ERROR data["<<i<<"]=" << data[i] << " checkData["<<i<<"]=" << checkData[i] << std::endl;
-                }
-            }
-        } else {
-            if(shim.verbose) {
-                shim.tsos << "TIMING send_matrix: check A : passed" << std::endl;
-            }
-        }
-        // new_session(shim);
-    } // if
-
-//
-    // reshape to rectangular from a simple vector of data
-    // NOTE: this interprets the linear stream of data as row-major, which is useful for c-style matrices.
-    // if this C++ code were to be used from, e.g. R, Fortran, (Python/Numpy?), then we would
-    // need an argument to this routine that we need a transpose here instead of a simple reshape
-    // (or more control over the reshape)
-    //
-    char reshapeQuery[1000];
-    sprintf(reshapeQuery, "store(reshape(TMPLOAD123,<v:%s>[r=0:%ld-1,1000,0,c=0:%ld-1,1000,0]),%s)",
-                           scalarName, nrow, ncol, resultName.c_str());
-    if(shim.verbose) {
-        shim.tsos << "[verbose] send_matrix: reshapeQuery is '" << reshapeQuery << "'" << std::endl; 
-    }
-
-    qid = executeQuery(shim, reshapeQuery);
-    if(shim.verbose) {
-        shim.tsos << "[verbose] send_matrix: reshape QID: " << qid << std::endl;
-    }
-    new_session(shim); // without this one, we get errors
-
-    // so lets check the info in the rectangular (resultName) array
-    if(shim.check && (nrow * ncol <= CHECK_DATA_SIZE)) {
-        if(shim.verbose) {
-            shim.tsos << "[verbose] send_matrix: CHECK2: issuing scan of the reshaped  matrix" << std::endl;
-        }
-        scan_matrix(shim, resultName, scalarName, nrow, ncol);
-        scalar_tt checkData[CHECK_DATA_SIZE];
-        memset(checkData, 0, nrow*ncol*sizeof(scalar_tt));
-        readBytesMatrix(shim, checkData, nrow, ncol); 
-        if(shim.verbose) {
-            shim.tsos << "[verbose] send_matrix: check2 results received" << std::endl;
-        }
-        if(memcmp(data, checkData, nrow*ncol*sizeof(scalar_tt))) {
-            shim.tsos << "ERROR send_matrix: check2 results differ" << std::endl;
-            for(size_t i =0; i < nrow*ncol; i++) {
-                if (data[i] != checkData[i]) {
-                    shim.tsos << "ERROR data["<<i<<"]=" << data[i] << " checkData["<<i<<"]=" << checkData[i] << std::endl;
-                }
-            }
-        } else {
-            if(shim.verbose) {
-                shim.tsos << "[verbose] send_matrix: check2 passed" << std::endl;
-            }
-        }
-        // new_session(shim);
-    }
+    if(true || !shim.lazyEval) {
+        // add store, return array's name
+        result = resultName;
+        std::string qid = executeQuery(shim, "send_matrix store(input())", loadQuery);
     
-    //
-    // finally, remove array TMPLOAD123
-    //
-    qid = executeQuery(shim, "remove(TMPLOAD123)");
-    if(shim.verbose) {
-        shim.tsos << "[verbose] remove QID: " << qid << std::endl;
+        if(shim.check) { // check the info in the resulting array
+            scan_matrix(shim, resultName, scalarName, nrow, ncol);
+            std::vector<scalar_tt> checkData(nrow*ncol,0);
+            if(shim.verbose) { shim.tsos << "[v]               send_matrix: reading back for check'" << std::endl; }
+            readResultMatrix<scalar_tt>(shim, "check uploaded matrix", &(checkData[0]), nrow, ncol);
+            if(memcmp(data, &(checkData[0]), dataBytes)) {
+                shim.tsos << "ERROR send_matrix: round-trip check fails" << std::endl;
+                for(size_t i =0; i < nrow*ncol; i++) {
+                    if (data[i] != checkData[i]) {
+                        shim.tsos << "ERROR val["<<i<<"]=" << data[i] << " returned as " << checkData[i] << std::endl;
+                    }
+                }
+            }
+        }
+    } else {
+        sprintf(loadQuery, "input(<v:%s>[i=0:%ld-1,1000*1000,0],'%s',-2,'(%s)')",
+                            scalarName, nrow * ncol, filePath.c_str(), scalarName);
+        result = loadQuery; // use the query, not the array name
     }
-    new_session(shim);
-
+        
     return resultName;
 }
 
@@ -694,45 +962,20 @@ std::string send_matrix(Shim& shim, const scalar_tt* data, size_t nrow, size_t n
 template<typename scalar_tt>
 void queryGemm(Shim& shim, const std::string& nameA, const std::string& nameB, const std::string& nameC,
                            bool transA, bool transB, scalar_tt alpha, scalar_tt beta,
-                           const std::string& storeArrayName,
                            const std::string& scalarName, size_t cRow, size_t cCol)
 {
-    if (storeArrayName.size() && scalarName.size()) {
-        throw std::runtime_error("queryGemm: only one of storeArrayName and scalarName may be specified");
-    }
-    if (storeArrayName.size() + scalarName.size() == 0) {
-        throw std::runtime_error("queryGemm: storeArrayName or scalarName must be specified");
-        // not 100% true, it would run, but what would be the value of not recording the answer
-    }
-
-
     //
     // start the query
     //
-    std::stringstream query;
-    if (storeArrayName.size()) {                // storing option
-        if(shim.verbose) {
-            std::cerr << "queryGemm storeArrayName: '" << storeArrayName
-                      << "', .size(): " << storeArrayName.size() << std::endl;
-        }
-        query << "store(" ;
-    } else {
-        //
-        // start a reshape to a 1D vector which forces the data to come back
-        // in row-major serialized order.
-        //
-        query << "reshape(";
-    }
-
-    //
-    // there is no gemm for float.  if scalarName == "float"
-    // then we need to use project(apply()) to increase array to double precision.
-    // and we need to do the reverse at the end
-    // NOTE: we could have a fgemm macro that woudl do this
     std::string exprA = nameA;
     std::string exprB = nameB;
     std::string exprC = nameC;
-    if (scalarName == std::string("float")) {
+    const bool scidbGemmDoubleOnly = getenv("SCIDB_GEMM_DOUBLE_ONLY");
+    if (scidbGemmDoubleOnly && scalarName == std::string("float")) {
+        // there is no gemm for float.  if scalarName == "float"
+        // then we need to use project(apply()) to increase array to double precision.
+        // and we need to do the reverse at the end
+        // NOTE: we could have a fgemm macro that would do this
         exprA = "project(apply(" + nameA + ",vDbl,double(v)), vDbl)" ;
         exprB = "project(apply(" + nameB + ",vDbl,double(v)), vDbl)" ;
         exprC = "project(apply(" + nameC + ",vDbl,double(v)), vDbl)" ;
@@ -742,31 +985,26 @@ void queryGemm(Shim& shim, const std::string& nameA, const std::string& nameB, c
     // gemm portion of the query
     //
     std::stringstream gemmQuery;
+    if (scidbGemmDoubleOnly && scalarName == std::string("float")) {
+        // have to convert to double with an apply :(
+        gemmQuery << "project(apply(" ;
+    }
+
     gemmQuery << "gemm(" << exprA << "," << exprB << "," << exprC ;
     gemmQuery << ",'TRANSA=" << long(transA) << ";TRANSB=" << long(transB); 
     gemmQuery << ";ALPHA=" << alpha << ";BETA=" << beta << "')";
 
-    if (scalarName == std::string("float")) {
-        query << "project(apply(" << gemmQuery.str() << ", vFlt, float(gemm)), vFlt)";
-    } else {
-        query << gemmQuery.str();
+    if (scidbGemmDoubleOnly && scalarName == std::string("float")) {
+        // have to close the apply
+        gemmQuery << ", vFlt, float(gemm)), vFlt)";
     }
 
-    //
-    // close the store or the reshape
-    //
-    if (storeArrayName.size()) {                // storing option
-        // close the store
-        query << "," << storeArrayName << ")";
-    } else {
-        // close the reshape
-        query << ", <v:double>[i=0:"<<cRow*cCol<<"-1,1000,0])";
-    }
     if(shim.verbose) {
-        std::cerr << "[verbose] queryGemm: gemmQuery is '" << query.str() << "'" << std::endl; 
+        std::cerr << "[v] queryGemm: gemmQuery is '" << gemmQuery.str() << "'" << std::endl; 
     }
-
-    std::string qid = executeQuery(shim, query.str(), scalarName);
+    // as root of expression tree currenly,
+    // gemm's don't lazyEval
+    std::string qid = executeQuery(shim, "queryGemm", gemmQuery.str(), scalarName);
 }
 
 //
@@ -799,6 +1037,18 @@ Shim& getShim()
             curl_easy_setopt(easyHandle, CURLOPT_DEBUGFUNCTION, my_trace);
             curl_easy_setopt(easyHandle, CURLOPT_VERBOSE, 1L);             // requried to enable my_trace
         }
+        
+        //
+        // get the URL
+        //
+        std::string baseURL;
+        const char * envURL = getenv("SCIDB_SHIM_URL");
+        if (!envURL) {
+            baseURL = std::string("http://localhost:8080");  // a reasonable default, works if running on a coordinator
+                                                             // TODO when authentication implemented, change default to https:
+        } else {
+            baseURL = std::string(envURL);
+        }
 
         // sketch of authorization for use with https (unverified).
         // e.g. use
@@ -808,8 +1058,8 @@ Shim& getShim()
         // (this latter option would need to be implemented throughout)
         //
         if(false) {
-            curl_easy_setopt(easyHandle, CURLOPT_URL, "http://localhost:8080");
-            curl_easy_setopt(easyHandle, CURLOPT_WRITEFUNCTION, receiveData);
+            curl_easy_setopt(easyHandle, CURLOPT_URL, baseURL.c_str());
+            curl_easy_setopt(easyHandle, CURLOPT_WRITEFUNCTION, CBRecvData);
             curl_easy_setopt(easyHandle, CURLOPT_WRITEDATA, NULL); // we don't want the data back
             CURLcode code = curl_easy_perform(easyHandle);
             if(code != CURLE_OK) {
@@ -824,24 +1074,13 @@ Shim& getShim()
             // curl_easy_dupheandle()
         }
 
-        //
-        // get the URL
-        //
-        std::string baseURL;
-        const char * envURL = getenv("SCIDB_SHIM_URL");
-        if (!envURL) {
-            baseURL = std::string("http://localhost:8080");  // a reasonable default, works if running on a coordinator
-                                                             // TODO when authentication implemented, change default to https:
-        } else {
-            baseURL = std::string(envURL);
-        }
         
         //
         // get a session
         //
         std::string fullURL = baseURL + std::string("/new_session");
         std::string session;
-        // TODO TODO switch to doHTMLGetString
+        // TODO TODO switch to curlGetString
         if (false) { // TODO, remove me
             curl_easy_setopt(easyHandle, CURLOPT_URL, fullURL.c_str());
             curl_easy_setopt(easyHandle, CURLOPT_WRITEFUNCTION, receiveString);
@@ -857,7 +1096,7 @@ Shim& getShim()
             session = sessionStr;
         } else {
             // active point
-            session  = doHTMLGetString(easyHandle, fullURL.c_str());
+            session  = curlGetString(easyHandle, fullURL.c_str());
         }
 
         // TODO: check the session and if not obtained, throw a std::runtime_error()
@@ -869,9 +1108,12 @@ Shim& getShim()
         //
         cachedShim = new Shim(easyHandle, baseURL, session, std::cerr);
         if(cachedShim->verbose) {
-            cachedShim->tsos << "[verbose] getsShim: created new Shim(,\"" << baseURL << " ," << session << ")" << std::endl;
+            cachedShim->tsos << "[v]                getsShim: created new Shim(,\"" << baseURL << " ," << session << ")" << std::endl;
         }
-
+    
+        // load dense linear algebra for dgemm
+        executeQuery(*cachedShim, "getShim load_library dense_linear_algebra",
+                     "load_library('dense_linear_algebra')");
     }
 
     return *cachedShim;
@@ -902,7 +1144,7 @@ void gemmScidbServer(const char& TRANSA, const char& TRANSB,
                      scalar_tt ALPHA, const scalar_tt* aData, long LDA,
                                       const scalar_tt* bData, long LDB,
                      scalar_tt BETA,        scalar_tt* cData, long LDC,
-                     Shim& shim, bool doTiming)
+                     Shim& shim)
 {
     const char* scalarName=typeStr(aData[0]);
 
@@ -915,11 +1157,8 @@ void gemmScidbServer(const char& TRANSA, const char& TRANSB,
     }
 
     // load dense linear algebra for dgemm
-    std::string qid = executeQuery(shim, "load_library('dense_linear_algebra')");
-    if(shim.verbose) {
-        shim.tsos << "TIMING gemmScidbServer: load_library('dense_linear_algebra') done" << std::endl;
-    }
-    new_session(shim);
+    std::string qid = executeQuery(shim, "gemmScidbServer load_library", "load_library('dense_linear_algebra')");
+    //new_session(shim);
 
     bool transA=(boolFromTransposeFlag(TRANSA));
     long aRow = (transA==false)? M : K;
@@ -946,15 +1185,15 @@ void gemmScidbServer(const char& TRANSA, const char& TRANSB,
     double start = getsecs();
     std::string aName = send_matrix(shim, aData, aRow, aCol, "TMPA");
     double secs = getsecs() - start;
-    if(doTiming || shim.verbose) {
-        shim.tsos << "gemmScidbServer send_matrix A: " <<aRow<< " x " <<aCol<< " " <<secs<< " s" << std::endl;
+    if(std::isfinite(shim.timing) || shim.verbose) {
+        shim.tsos << "[t] "<< secs << " =SUBTOTAL gemmScidbServer send_matrix A: " <<aRow<< " x " <<aCol<< std::endl;
     }
 
     start = getsecs();
     std::string bName = send_matrix(shim, bData, bRow, bCol, "TMPB");
     secs = getsecs() - start;
-    if(doTiming || shim.verbose) {
-        shim.tsos << "gemmScidbServer send_matrix B: " <<bRow<< " x " <<bCol<< " " <<secs<< " s" << std::endl;
+    if(std::isfinite(shim.timing) || shim.verbose) {
+        shim.tsos << "[t] "<< secs << " =SUBTOTAL gemmScidbServer send_matrix B: " <<bRow<< " x " <<bCol<<  std::endl;
     }
 
     std::string cName;
@@ -963,55 +1202,40 @@ void gemmScidbServer(const char& TRANSA, const char& TRANSB,
         double start = getsecs();
         cName = create_temp_matrix(shim, cRow, cCol, "TMPC", scalarName);
         double secs = getsecs() - start;
-        if(doTiming || shim.verbose) {
-            shim.tsos << "gemmScidbServer create empty C: " <<cRow<< " x " <<cCol<< " " <<secs<< " s" << std::endl;
+        if(std::isfinite(shim.timing) || shim.verbose) {
+            shim.tsos << "[t] " << secs << " =SUBTOTAL gemmScidbServer create empty C: " <<cRow<< " x " <<cCol << std::endl;
         }
     } else {
         double start = getsecs();
         cName = send_matrix(shim, cData, cRow, cCol, "TMPC");
         double secs = getsecs() - start;
-        if(doTiming || shim.verbose) {
-            shim.tsos << "gemmScidbServer send_matrix C: " <<cRow<< " x " <<cCol<< " " <<secs<< " s" << std::endl;
+        if(std::isfinite(shim.timing) || shim.verbose) {
+            shim.tsos << "[t] " << secs << " =SUBTOTAL gemmScidbServer send_matrix C: " <<cRow<< " x " <<cCol<< std::endl;
         }
     }
 
     // run the query
     {
-        double start = getsecs();
         bool debugUsingShow=false;
         if(debugUsingShow) {
             scan_matrix(shim, aName, scalarName, cRow, cCol);
-            if(shim.verbose) {
-                shim.tsos << "gemmScidbServer: scan_matrix called" << std::endl;
-            }
         } else {
-            queryGemm(shim, aName, bName, cName, transA, transB, /*alpha*/ALPHA, /*beta*/BETA, "", scalarName, cRow, cCol);
+            queryGemm(shim, aName, bName, cName, transA, transB, /*alpha*/ALPHA, /*beta*/BETA, scalarName, cRow, cCol);
             // answer should be
             // [22.5 49.5]
             // [28.5 64.5]
-            if(shim.verbose) {
-                shim.tsos << "TIMING gemmScidbServer: queryGemm called" << std::endl;
-            }
         }
 
-        //and read the output back into an array
-        readBytesMatrix(shim, cData, cRow, cCol); 
-        double secs = getsecs() - start;
-        if(doTiming || shim.verbose) {
-            shim.tsos << "gemmScidbServer query executed and results received: " << secs << " s" << std::endl;
-        }
+        //and read the output back into the "C" array
+        if(shim.verbose) { shim.tsos << "[v]               gemmScidbServer: reading result C'" << std::endl; }
+        readResultMatrix<scalar_tt>(shim, "read result 'C' array", cData, cRow, cCol); 
     }
 
     // and remove the arrays
     {
-        double start = getsecs();
-        qid = executeQuery(shim, "remove(TMPA)");
-        qid = executeQuery(shim, "remove(TMPB)");
-        qid = executeQuery(shim, "remove(TMPC)");
-        double secs = getsecs() - start;
-        if(doTiming || shim.verbose) {
-            shim.tsos << "gemmScidbServer removed A,B,C in: " << secs << " s" << std::endl;
-        }
+        std::string qidA = executeQuery(shim, "gemmScidbServer remove A", "remove(TMPA)");
+        std::string qidB = executeQuery(shim, "gemmScidbServer remove B", "remove(TMPB)");
+        std::string qidC = executeQuery(shim, "gemmScidbServer remove C", "remove(TMPC)");
     }
 }
 
@@ -1026,7 +1250,6 @@ int mainTest(scalar_tt value)
 {
     Shim& shim = getShim();     // with active session
     shim.verbose= true;         // timed tracing
-    bool doTiming=true;
 
     const char* scalarName=typeStr(value);
 
@@ -1087,7 +1310,7 @@ int mainTest(scalar_tt value)
         if(debugWithShow) {
             scan_matrix(shim, aName, scalarName, cRow, cCol);
         } else {
-            queryGemm(shim, aName, bName, cName, transA, transB, /*alpha*/1.0, /*beta*/0.5, "", scalarName, cRow, cCol);
+            queryGemm(shim, aName, bName, cName, transA, transB, /*alpha*/1.0, /*beta*/0.5, scalarName, cRow, cCol);
             // answer should be
             // [22.5 49.5]
             // [28.5 64.5]
@@ -1097,7 +1320,7 @@ int mainTest(scalar_tt value)
         const size_t dRow = cRow;
         const size_t dCol = cCol;
         double dData[dRow*dCol];
-        readBytesMatrix(shim, dData, dRow, dCol); 
+        readResultMatrix<scalar_tt>(shim, "unit tests", dData, dRow, dCol); 
         for(size_t i=0; i< dRow*dCol; i++) {
             shim.tsos << "unit_test dgemm result["<<i<<"] = " << dData[i] << std::endl;
         }
@@ -1112,7 +1335,7 @@ int mainTest(scalar_tt value)
                      1.0, aData, /*LDA*/aRow,
                           bData, /*LDB*/bRow,
                      0.5, cData, /*LDC*/cRow,
-                     shim, doTiming);
+                     shim);
 
     for(size_t i=0; i< cRow*cCol; i++) {
         shim.tsos << "dgemm result["<<i<<"] = " << cData[i] << std::endl;
@@ -1129,7 +1352,7 @@ int mainTest(scalar_tt value)
                      1.0, aData, /*LDA*/aRow,
                           bData, /*LDB*/bRow,
                      0.1, cData, /*LDC*/cRow,
-                     shim, doTiming);
+                     shim);
 
     for(size_t i=0; i< cRow*cCol; i++) {
         shim.tsos << "dgemm result["<<i<<"] = " << cData[i] << std::endl;
@@ -1260,13 +1483,12 @@ void caffe_scidb_gemm(const CBLAS_TRANSPOSE TransA, const CBLAS_TRANSPOSE TransB
         localLimit = atol(limitStr);
     }
 
-    bool doTiming = bool(getenv("SCIDB_SHIM_TIME"));
-
-    double secsToPrintLimit = 0.0;
     const char* doTimingStr = getenv("SCIDB_SHIM_TIME");
     if (doTimingStr) {
-        secsToPrintLimit = atof(doTimingStr);
+        shim.timing = atof(doTimingStr);
     }
+
+    shim.lazyEval = true;               // return queries, not array names
 
     static bool dotsNeedNewline=false;
 
@@ -1281,16 +1503,17 @@ void caffe_scidb_gemm(const CBLAS_TRANSPOSE TransA, const CBLAS_TRANSPOSE TransB
                            bData, ldb,
                     beta,  cData, N);
         double secs = scidb::getsecs() - start;
-        if (doTiming) {
-            if(secs >= secsToPrintLimit) {
+        if (std::isfinite(shim.timing)) {
+            if(secs >= shim.timing) {
                 if(dotsNeedNewline) {
                     std::cerr << std::endl;
                     dotsNeedNewline=true;
                 }
-                shim.tsos << "caffe_scidb_gemm: cblas: " << scidb::typeStr(aData[0])
+                shim.tsos << "[t] " << secs << " ==TOTAL"
+                          << " caffe_scidb_gemm: cblas: " << scidb::typeStr(aData[0])
                           << " " << M << "*" << K << "*" << N
-                          << " beta " << beta << ", " << secs << " s, "
-                          << 1e-6*M*K*N/(secs) << " MFLOP/s" << std::endl; 
+                          << " beta " << beta
+                          << ", " << 1e-6*M*K*N/(secs) << " MFLOP/s" << std::endl; 
             } else {
                 std::cerr << "c" ;
                 dotsNeedNewline=true;
@@ -1351,18 +1574,19 @@ void caffe_scidb_gemm(const CBLAS_TRANSPOSE TransA, const CBLAS_TRANSPOSE TransB
                                alpha, aData, lda /*M?*/, 
                                       bData, ldb /*K?*/,
                                beta,  cData, ldc /*N?*/,
-                               shim,  doTiming);
+                               shim);
         double secs = scidb::getsecs() - start;
-        if(doTiming || shim.check) {            // NOCHECKIN: experiment, print timing when checking
-            if(secs >= secsToPrintLimit) {
+        if(std::isfinite(shim.timing) || shim.check) {
+            if(secs >= shim.timing) {
                 if(dotsNeedNewline) {
                     std::cerr << std::endl;
                     dotsNeedNewline=true;
                 }
-                shim.tsos << "caffe_scidb_gemm: scidb: " << scidb::typeStr(aData[0])
+                shim.tsos << "[t] " << secs << " ==TOTAL"
+                          << " caffe_scidb_gemm: scidb: " << scidb::typeStr(aData[0])
                           << " " << M << "*" << K << "*" << N
-                          << " beta " << beta << ", " << secs << " s, "
-                          << 1e-6*M*K*N/(secs) << " MFLOP/s" << std::endl; 
+                          << " beta " << beta
+                          << ", " << 1e-6*M*K*N/(secs) << " MFLOP/s" << std::endl; 
                 timingPrinted=true;
             } else {
                 std::cerr << "s" ;
@@ -1393,9 +1617,10 @@ void caffe_scidb_gemm(const CBLAS_TRANSPOSE TransA, const CBLAS_TRANSPOSE TransB
                    beta,  cResultBlas, N);
         double secs = scidb::getsecs() - start;
         if(timingPrinted) {
-            shim.tsos << "caffe_scidb_gemm: cblas check: " << scidb::typeStr(aData[0])
+            shim.tsos << "[t] " << secs << " ==TOTAL"
+                      << " caffe_scidb_gemm: cblas check: " << scidb::typeStr(aData[0])
                       << " MKN: " << M << "*" << K << "*" << N
-                      << " beta " << beta << ", " << secs << " s, "
+                      << " beta " << beta << ", "
                       << 1e-6*M*K*N/(secs) << " MFLOP/s" << std::endl; 
         }
 
